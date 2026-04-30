@@ -31,15 +31,11 @@ class Node:
         return self.value_sum / self.visit_count
 
 def get_valid_moves(board, turn):
-    valid = []
-    board_size = board.size
-    for i in range(board_size):
-        for j in range(board_size):
-            if board.tiles[i][j].colour is None:
-                valid.append(i * board_size + j)
+    """Get valid moves using cached empty cells (O(1) instead of O(n²))."""
+    valid = list(board.get_empty_cells())  # Fast copy of cached list
     # Turn 2 is the second move of the game, made by the second player
     if turn == 2:
-        valid.append(board_size * board_size) # Swap action
+        valid.append(board.size * board.size)  # Swap action
     return valid
 
 _BOARD_POOL = []
@@ -57,6 +53,10 @@ def fast_clone_board(board):
     for i in range(board.size):
         for j in range(board.size):
             new_board.tiles[i][j].colour = board.tiles[i][j].colour
+    # Copy empty cells cache
+    new_board._empty_cells = list(board._empty_cells)
+    # Copy numpy array cache
+    new_board._color_array = board._color_array.copy()
     return new_board
 
 def release_board(board):
@@ -88,26 +88,26 @@ def apply_move(board, current_colour, turn, action, inplace=False, check_win=Tru
     return new_board, next_colour, turn + 1, is_terminal, winner
 
 def encode_state(board, current_colour, device, out_tensor=None):
+    """Encode board state using cached numpy array for O(1) vectorized encoding."""
     board_size = board.size
     if out_tensor is None:
         out_tensor = torch.zeros(1, 3, board_size, board_size, device=device)
     else:
         out_tensor.zero_()
-        
-    # Extract board colors quickly without nested python loops
-    # Assuming tile.colour is None, Colour.RED, or Colour.BLUE
-    flat_colors = [tile.colour for row in board.tiles for tile in row]
     
-    for idx, color in enumerate(flat_colors):
-        if color is None: continue
-        i, j = divmod(idx, board_size)
-        if color == current_colour:
-            out_tensor[0, 0, i, j] = 1.0
-        else:
-            out_tensor[0, 1, i, j] = 1.0
-            
+    # Use cached numpy array - vectorized operations, no Python loops
+    color_arr = board.get_color_array()
+    
     if current_colour == Colour.RED:
-        out_tensor[0, 2, :, :] = 1.0
+        # RED's turn: channel 0 = RED stones, channel 1 = BLUE stones
+        out_tensor[0, 0] = torch.from_numpy(color_arr == 1).float()
+        out_tensor[0, 1] = torch.from_numpy(color_arr == 2).float()
+        out_tensor[0, 2] = 1.0  # Current player indicator
+    else:
+        # BLUE's turn: channel 0 = BLUE stones (opponent), channel 1 = RED stones (current)
+        out_tensor[0, 0] = torch.from_numpy(color_arr == 2).float()
+        out_tensor[0, 1] = torch.from_numpy(color_arr == 1).float()
+        # No channel 2 for BLUE (or could be 0)
         
     return out_tensor
 
@@ -134,15 +134,19 @@ class MCTS:
         valid_moves = get_valid_moves(board, turn)
         
         if len(valid_moves) > 0:
-            policy_sum = sum(policy_probs[a] for a in valid_moves)
+            k = min(20, len(valid_moves))
+            top_k = np.argsort(policy_probs[valid_moves])[-k:]
+            top_k_moves = [valid_moves[idx] for idx in top_k]
+            
+            policy_sum = sum(policy_probs[a] for a in top_k_moves)
             
             # Add Dirichlet Noise to root node
             epsilon = 0.25
-            alpha = 0.2
-            noise = np.random.dirichlet([alpha] * len(valid_moves))
+            alpha = 0.3
+            noise = np.random.dirichlet([alpha] * len(top_k_moves))
             
-            for idx, a in enumerate(valid_moves):
-                p = (1 - epsilon) * (policy_probs[a] / policy_sum) + epsilon * noise[idx] if policy_sum > 0 else 1.0 / len(valid_moves)
+            for idx, a in enumerate(top_k_moves):
+                p = (1 - epsilon) * (policy_probs[a] / policy_sum) + epsilon * noise[idx] if policy_sum > 0 else 1.0 / len(top_k_moves)
                 child_node = Node(p, parent=root, action_from_parent=a)
                 child_node.q_prior = q_values[a]
                 
@@ -197,9 +201,13 @@ class MCTS:
                 if len(valid_moves) == 0:
                     value = 0 
                 else:
-                    policy_sum = sum(policy_probs[a] for a in valid_moves)
-                    for a in valid_moves:
-                        p = policy_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(valid_moves)
+                    k = min(20, len(valid_moves))
+                    top_k = np.argsort(policy_probs[valid_moves])[-k:]
+                    top_k_moves = [valid_moves[idx] for idx in top_k]
+                    
+                    policy_sum = sum(policy_probs[a] for a in top_k_moves)
+                    for a in top_k_moves:
+                        p = policy_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
                         child_node = Node(p, parent=node, action_from_parent=a)
                         child_node.q_prior = q_values[a]
                         
@@ -239,7 +247,7 @@ class MCTS:
 
 
 class BatchedMCTS:
-    def __init__(self, model, num_simulations=100, temperature=1.0, c_puct=1.5, add_noise=True):
+    def __init__(self, model, num_simulations=100, temperature=1.0, c_puct=2.0, add_noise=True):
         self.model = model
         self.num_simulations = num_simulations
         self.temperature = temperature
@@ -270,7 +278,7 @@ class BatchedMCTS:
             q_values = q_preds.cpu().numpy()
             
             epsilon = 0.25
-            alpha = 0.2
+            alpha = 0.3
             
             for idx_idx, idx in enumerate(unexpanded_roots):
                 game = active_games[idx]
@@ -280,15 +288,20 @@ class BatchedMCTS:
                 if valid_moves:
                     p_probs = policy_probs[idx_idx]
                     q_vals = q_values[idx_idx]
-                    policy_sum = sum(p_probs[a] for a in valid_moves)
-                    if self.add_noise:
-                        noise = np.random.dirichlet([alpha] * len(valid_moves))
                     
-                    for noise_idx, a in enumerate(valid_moves):
+                    k = min(20, len(valid_moves))
+                    top_k = np.argsort(p_probs[valid_moves])[-k:]
+                    top_k_moves = [valid_moves[idx] for idx in top_k]
+                    
+                    policy_sum = sum(p_probs[a] for a in top_k_moves)
+                    if self.add_noise:
+                        noise = np.random.dirichlet([alpha] * len(top_k_moves))
+                    
+                    for noise_idx, a in enumerate(top_k_moves):
                         if self.add_noise:
-                            p = (1 - epsilon) * (p_probs[a] / policy_sum) + epsilon * noise[noise_idx] if policy_sum > 0 else 1.0 / len(valid_moves)
+                            p = (1 - epsilon) * (p_probs[a] / policy_sum) + epsilon * noise[noise_idx] if policy_sum > 0 else 1.0 / len(top_k_moves)
                         else:
-                            p = p_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(valid_moves)
+                            p = p_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
                         child = Node(p, parent=root, action_from_parent=a)
                         child.q_prior = q_vals[a]
                         
@@ -376,9 +389,13 @@ class BatchedMCTS:
                     if not valid_moves:
                         value = 0.0
                     else:
-                        policy_sum = sum(p_probs[a] for a in valid_moves)
-                        for a in valid_moves:
-                            p = p_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(valid_moves)
+                        k = min(20, len(valid_moves))
+                        top_k = np.argsort(p_probs[valid_moves])[-k:]
+                        top_k_moves = [valid_moves[idx] for idx in top_k]
+                        
+                        policy_sum = sum(p_probs[a] for a in top_k_moves)
+                        for a in top_k_moves:
+                            p = p_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
                             child = Node(p, parent=leaf_node, action_from_parent=a)
                             child.q_prior = q_vals[a]
                             

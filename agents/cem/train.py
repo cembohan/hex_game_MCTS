@@ -207,8 +207,8 @@ def self_play(model, buffer, num_games=10, mcts_simulations=100):
             
             valid_moves = get_valid_moves(game['board'], game['turn'])
             
-            # High temp for first 15 moves, then greedy to finish strong
-            temp = 1.0 if game['turn'] < 15 else 0.1
+            # High temp for first 10 moves, then greedy to finish strong
+            temp = 1.0 if game['turn'] < 10 else 0.5 if game['turn'] < 20 else 0.1
             
             if temp == 0.1:
                 action = torch.argmax(pi).item()
@@ -340,9 +340,10 @@ if __name__ == "__main__":
     
     # Training Loop
     EPOCHS = 100
-    GAMES_PER_EPOCH = 35
-    BATCH_SIZE = 512
-    TRAINING_STEPS = 400
+    GAMES_PER_EPOCH = 12
+    BATCH_SIZE = 256
+    TRAINING_STEPS = 200
+    EVAL_EVERY = 3  # Only evaluate every N epochs to save time
     
     for epoch in range(iteration, iteration + EPOCHS):
         logger.info(f"--- Epoch {epoch+1} ---")
@@ -352,11 +353,11 @@ if __name__ == "__main__":
             sp_sims = 30
             eval_sims = 50
         elif epoch < 50:
-            sp_sims = 100
-            eval_sims = 100
+            sp_sims = 30
+            eval_sims = 30
         else:
             sp_sims = 100
-            eval_sims = 400
+            eval_sims = 200
             
         # 1. Self Play
         logger.info(f"Starting Self-Play (sims={sp_sims})...")
@@ -389,20 +390,24 @@ if __name__ == "__main__":
             logger.info(f"Training Loss: {total_loss/TRAINING_STEPS:.4f} (P: {total_p/TRAINING_STEPS:.4f}, "
                         f"V: {total_v/TRAINING_STEPS:.4f}, Q: {total_q/TRAINING_STEPS:.4f}) | Valid Buffer: {valid_buffer_size}")
         
-        # 3. Evaluate
-        logger.info(f"Evaluating (sims={eval_sims})...")
-        is_better = evaluate_batched(temp_model, best_model, num_games=20, eval_sims=eval_sims)
-        
-        if is_better:
-            logger.info("Temp model is better! Saving as new best_model.")
-            best_model.load_state_dict(temp_model.state_dict())
-            trainer.save_checkpoint(epoch+1, path="agents/cem/")
-            torch.save({
-                'iteration': epoch+1,
-                'model_state_dict': best_model.state_dict(),
-                'optimizer_state_dict': trainer.optimizer.state_dict(),
-            }, "agents/cem/best_model.pt")
+        # 3. Evaluate (only every EVAL_EVERY epochs)
+        if (epoch - iteration) % EVAL_EVERY == 0:
+            logger.info(f"Evaluating (sims={eval_sims})...")
+            is_better = evaluate_batched(temp_model, best_model, num_games=20, eval_sims=eval_sims)
+            
+            if is_better:
+                logger.info("Temp model is better! Saving as new best_model.")
+                best_model.load_state_dict(temp_model.state_dict())
+                trainer.save_checkpoint(epoch+1, path="agents/cem/")
+                torch.save({
+                    'iteration': epoch+1,
+                    'model_state_dict': best_model.state_dict(),
+                    'optimizer_state_dict': trainer.optimizer.state_dict(),
+                }, "agents/cem/best_model.pt")
+            else:
+                logger.info("Temp model rejected. Keeping previous best_model.")
         else:
-            logger.info("Temp model rejected. Keeping previous best_model.")
+            # Still copy temp model weights to best_model for next iteration's self-play
+            best_model.load_state_dict(temp_model.state_dict())
             
         print("\n")

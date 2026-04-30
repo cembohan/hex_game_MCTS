@@ -1,5 +1,6 @@
 from src.Colour import Colour
 from src.Tile import Tile
+import numpy as np
 
 
 class Board:
@@ -22,6 +23,10 @@ class Board:
         self._winner = None
         # store coordinates of winning path tiles
         self._winning_path: set[tuple[int, int]] = set()
+        # Cache of empty cell indices for O(1) valid move retrieval
+        self._empty_cells: list[int] = [i * board_size + j for j in range(board_size) for i in range(board_size)]
+        # Fast numpy array for state encoding (0=empty, 1=RED, 2=BLUE)
+        self._color_array: np.ndarray = np.zeros((board_size, board_size), dtype=np.uint8)
 
     def __str__(self) -> str:
         return self.print_board()
@@ -53,7 +58,24 @@ class Board:
             chars = line.split(" ")
             for j, char in enumerate(chars):
                 b.tiles[i][j].colour = Colour.from_char(char)
+        
+        # Rebuild empty cells cache after loading
+        b._rebuild_empty_cells()
         return b
+
+    def _rebuild_empty_cells(self):
+        """Rebuild the empty cells cache and numpy array from current board state."""
+        self._empty_cells = []
+        self._color_array.fill(0)
+        for i in range(self._size):
+            for j in range(self._size):
+                colour = self.tiles[i][j].colour
+                if colour is None:
+                    self._empty_cells.append(i * self._size + j)
+                elif colour == Colour.RED:
+                    self._color_array[i, j] = 1
+                else:
+                    self._color_array[i, j] = 2
 
     def has_ended(self, colour: Colour = None):
         """Checks if the game has ended. It will attempt to find a red chain
@@ -183,6 +205,27 @@ class Board:
 
     def set_tile_colour(self, x, y, colour) -> None:
         self.tiles[x][y].colour = colour
+        # Update empty cells cache
+        idx = x * self._size + y
+        if colour is None and idx not in self._empty_cells:
+            self._empty_cells.append(idx)
+        elif colour is not None and idx in self._empty_cells:
+            self._empty_cells.remove(idx)
+        # Update numpy array cache (0=empty, 1=RED, 2=BLUE)
+        if colour is None:
+            self._color_array[x, y] = 0
+        elif colour == Colour.RED:
+            self._color_array[x, y] = 1
+        else:
+            self._color_array[x, y] = 2
+
+    def get_empty_cells(self) -> list[int]:
+        """Return list of empty cell indices (cached, O(1))."""
+        return self._empty_cells
+
+    def get_color_array(self) -> np.ndarray:
+        """Return numpy array representation (0=empty, 1=RED, 2=BLUE)."""
+        return self._color_array
 
     def _compute_shortest_winning_path(self, colour: Colour):
         """Use BFS to find a shortest connection between the two sides
