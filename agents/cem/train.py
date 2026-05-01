@@ -18,7 +18,7 @@ import logging
 #TODO - Add graceful termination
 #TODO - Gather all hyperparameters into a config file or at least a single section at the top for easy tuning
 #TODO - Add notifications on epoch completion (discord, desktop etc.)
-#TODO: Make one every 10 games use swap rule
+#TODO: Make one every 10 games use swap rule, can make it play against other local agents for more diversity.
 #TODO: replay buffer wastes RAM by storing PyTorch tensors. We should convert to numpy before saving and back to tensor when sampling.
 #TODO: BatchedMCTS is currently a bottleneck due to PyTorch overhead. implement iterative backprop. look to replace "search_paths.append(path)"
 #TODO: "g['root'] = Node(0)" is a fallback that should never be hit. If it is, we leak the old subtree entirely. can consider g['root'] = None
@@ -413,9 +413,6 @@ if __name__ == "__main__":
     
     temp_model = Hex3HNN(board_size=11).to(device)
     temp_trainer = HexTrainer(temp_model)
-    
-    buffer = ReplayBuffer()
-    buffer.load("agents/cem/buffer.pt")
     
     # Initialize ReplayBuffer globally so it persists across epochs
     buffer = ReplayBuffer()
