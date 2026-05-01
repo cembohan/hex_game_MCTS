@@ -491,10 +491,21 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
 
                 valid_moves = get_valid_moves(game['board'], game['turn'])
 
-                # Always sample — even at low temp the distribution is already sharp.
+                # --- Temperature schedule ---
+                # BatchedMCTS returns raw visit proportions (temperature=1.0 inside MCTS).
+                # We apply the per-turn sharpening here so both the stored training label
+                # (pi stored in history) and the action sample come from the same distribution.
+                turn = game['turn']
+                temp = (TEMP_HIGH if turn < TEMP_HIGH_TURNS
+                        else TEMP_MID if turn < TEMP_MID_TURNS
+                        else TEMP_LOW)
+                if temp != 1.0:
+                    pi = pi ** (1.0 / temp)
+                    pi = pi / pi.sum()
+
                 # Controlled swap exposure: on turn 2 occasionally force a swap so the
                 # model sees both swap and no-swap outcomes in its training data.
-                if game['turn'] == 2 and 121 in valid_moves and random.random() < 0.3:
+                if turn == 2 and 121 in valid_moves and random.random() < 0.3:
                     action = 121  # force swap ~30% of the time on turn 2
                 else:
                     action = torch.multinomial(pi, 1).item()
