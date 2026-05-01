@@ -1,5 +1,7 @@
 import os
 import random
+import signal
+import sys
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -7,6 +9,20 @@ import numpy as np
 import time
 import gc
 from collections import deque
+
+# Graceful termination flag
+_shutdown_requested = False
+
+def _signal_handler(signum, frame):
+    """Handle Ctrl+C and termination signals gracefully."""
+    global _shutdown_requested
+    sig_name = signal.Signals(signum).name
+    print(f"\n>>> Received {sig_name}. Finishing current step, then saving and exiting...", flush=True)
+    _shutdown_requested = True
+
+def _check_shutdown():
+    """Check if graceful shutdown was requested."""
+    return _shutdown_requested
 
 from src.Board import Board
 from src.Colour import Colour
@@ -16,7 +32,6 @@ from agents.cem.agent1 import Hex3HNN
 from agents.cem.mcts import MCTS, BatchedMCTS, Node, encode_state, get_valid_moves, apply_move
 
 import logging
-#TODO - Add graceful termination
 #TODO - Add notifications on epoch completion (discord, desktop etc.)
 #TODO: replay buffer wastes RAM by storing PyTorch tensors. We should convert to numpy before saving and back to tensor when sampling.
 #TODO: BatchedMCTS is currently a bottleneck due to PyTorch overhead. implement iterative backprop. look to replace "search_paths.append(path)"
@@ -36,35 +51,36 @@ LEARNING_RATE = 0.001           # Adam optimizer learning rate
 WEIGHT_DECAY = 1e-4             # L2 regularization strength
 
 # --- Training Loop ---
-EPOCHS = 300                   # Total training epochs
-GAMES_PER_EPOCH = 12            # Self-play games per epoch
+EPOCHS = 3000                   # Total training epochs
+GAMES_PER_EPOCH = 24            # Self-play games per epoch
 BATCH_SIZE = 256                # Training batch size
 TRAINING_STEPS = 200            # Gradient updates per epoch
 EVAL_EVERY = 10                 # Evaluate every N epochs
-NUM_GAMES_EVAL = 24             # Games for evaluation
+NUM_GAMES_EVAL = 30             # Games for evaluation
 
 # --- MCTS Simulations ---
-SELF_PLAY_SIMS = 50             # MCTS simulations per move during self-play
-EVAL_SIMS = 150                 # MCTS simulations per move during evaluation
+SELF_PLAY_SIMS = 30             # MCTS simulations per move during self-play
+EVAL_SIMS = 75                # MCTS simulations per move during evaluation
 OPPONENT_GAME_SIMS = 100        # MCTS simulations per move vs local agents
 
 # --- MCTS Settings ---
 MCTS_TEMPERATURE = 1.0          # Exploration temperature for self-play
-MCTS_TEMPERATURE_EVAL = 0.1     # Exploration temperature for evaluation
+MCTS_TEMPERATURE_EVAL = 0.3     # Exploration temperature for evaluation
 ADD_NOISE = True                # Add Dirichlet noise to root (self-play only)
+C_PUCT = 2.0                    # UCB exploration constant (unified for MCTS and BatchedMCTS)
 
 # --- Temperature Schedule (for move selection) ---
-TEMP_HIGH_TURNS = 10            # Use high temp for first N turns
-TEMP_MID_TURNS = 20             # Use mid temp for next N turns
-TEMP_HIGH = 1.0                # High temperature value
-TEMP_MID = 0.5                  # Medium temperature value
+TEMP_HIGH_TURNS = 20            # Use high temp for first N turns
+TEMP_MID_TURNS = 30             # Use mid temp for next N turns
+TEMP_HIGH = 1.0                 # High temperature value
+TEMP_MID = 0.7                  # Medium temperature value
 TEMP_LOW = 0.1                  # Low temperature value (greedy)
 
 # --- Opponent Diversity ---
-OPPONENT_GAME_EVERY = 10        # Play vs local agent every N games (0 to disable)
+OPPONENT_GAME_EVERY = 0         # Play vs local agent every N games (0 to disable)
 
 # --- Evaluation ---
-EVAL_WIN_RATE_THRESHOLD = 0.50  # Win rate needed to replace best model (50%)
+EVAL_WIN_RATE_THRESHOLD = 0.55  # Win rate needed to replace best model (55%)
 
 # --- Board Size (fixed for now) ---
 BOARD_SIZE = 11
@@ -152,33 +168,46 @@ class ReplayBuffer:
             pickle.dump(list(self.buffer), f)
         
     def load(self, filename):
-        if os.path.isfile(filename):
+        if not os.path.isfile(filename):
+            print(f"No replay buffer found at {filename}. Starting with an empty buffer.")
+            return
+
+        loaded = None
+        load_error = None
+        try:
+            with open(filename, 'rb') as f:
+                loaded = pickle.load(f)
+                print(f"Loaded {len(loaded)} entries from pickle buffer file {filename}.")
+        except Exception as exc:
+            load_error = exc
             try:
-                # Try loading the new pickle format first
-                with open(filename, 'rb') as f:
-                    loaded = pickle.load(f)
-            except Exception:
-                # Fallback: Load your old PyTorch format buffer
                 loaded = torch.load(filename, map_location="cpu", weights_only=False)
-            
-            # 4. Clean up any lingering PyTorch tensors from an older save file
-            cleaned_loaded = []
-            for item in loaded:
-                state, pi, target_q, z, action, valid_moves = item
-                state_np = state.numpy() if isinstance(state, torch.Tensor) else state
-                cleaned_loaded.append((state_np, pi, target_q, z, action, valid_moves))
-                
-            self.buffer = deque(cleaned_loaded, maxlen=self.buffer.maxlen)
-            print(f"Loaded {len(self.buffer)} games from {filename} and normalized states.")
+                print(f"Loaded {len(loaded)} entries from torch buffer file {filename}.")
+            except Exception as exc2:
+                print(f"Warning: failed to load replay buffer from {filename}.\n"
+                      f"  pickle error: {load_error}\n"
+                      f"  torch error: {exc2}\n"
+                      "Starting with an empty buffer.")
+                self.buffer = deque(maxlen=self.buffer.maxlen)
+                return
+
+        cleaned_loaded = []
+        for item in loaded:
+            state, pi, target_q, z, action, valid_moves = item
+            state_np = state.numpy() if isinstance(state, torch.Tensor) else state
+            cleaned_loaded.append((state_np, pi, target_q, z, action, valid_moves))
+
+        self.buffer = deque(cleaned_loaded, maxlen=self.buffer.maxlen)
+        print(f"Loaded {len(self.buffer)} games from {filename} and normalized states.")
 
 
 class HexTrainer:
     def __init__(self, model, lr=LEARNING_RATE):
         self.model = model
-        self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
         self.history = {'loss': [], 'v_loss': [], 'p_loss': [], 'q_loss': []}
 
-    def train_step(self, states, target_pis, target_qs, target_vs, actions, valid_moves_list):
+    def train_step(self, states, target_pis, target_qs, target_vs, valid_moves_list):
         self.model.train()
         device = next(self.model.parameters()).device
         states = states.to(device)
@@ -285,7 +314,7 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
     opp_agent = load_random_local_agent(opp_colour)
     logger.debug(f"Opponent-diversity game: model={model_colour}, opp={type(opp_agent).__name__}")
 
-    mcts = MCTS(model, num_simulations=mcts_simulations, temperature=MCTS_TEMPERATURE)
+    mcts = MCTS(model, num_simulations=mcts_simulations, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE)
 
     history      = []          # (state_tensor, pi, target_q, colour, action, valid_moves)
     current_colour = Colour.RED
@@ -296,25 +325,24 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
     while True:
         if current_colour == model_colour:
             # ---- Model's turn: use MCTS ----
+            # mcts.search builds the tree and returns visit-count probs; it also
+            # stores the root internally so we can extract MCTS Q-targets from it.
             pi_tensor = mcts.search(board, current_colour, turn)
-            root      = mcts  # MCTS.search returns action_probs only; we need Q-values from the root
-
-            # Rebuild root data for Q-target (MCTS.search builds a fresh tree internally)
-            # We call search again on the same board for Q-values — but that's expensive.
-            # Instead, encode once for Q extraction.
             device = next(model.parameters()).device
-            with torch.no_grad():
-                state_t = encode_state(board, current_colour, device)
-                _, _, q_pred = model(state_t)
-            target_q = q_pred[0].cpu().numpy().astype(np.float32)  # shape (122,)
+
+            # Extract Q-targets from MCTS root (consistent with self_play definition)
+            root = mcts.last_root
+            target_q = np.zeros(122, dtype=np.float32)
+            visits = root.children_visits
+            visited = visits > 0
+            target_q[visited] = root.children_values[visited] / visits[visited]
+            target_q[~visited] = root.children_q_priors[~visited]
+            target_q[~root.children_exists] = 0.0
 
             valid_moves = get_valid_moves(board, turn)
 
-            temp = TEMP_HIGH if turn < TEMP_HIGH_TURNS else TEMP_MID if turn < TEMP_MID_TURNS else TEMP_LOW
-            if temp == 0.1:
-                action = int(torch.argmax(pi_tensor).item())
-            else:
-                action = int(torch.multinomial(pi_tensor, 1).item())
+            # Always sample — even at low temp the distribution is already sharp
+            action = int(torch.multinomial(pi_tensor, 1).item())
 
             state_cpu = encode_state(board, current_colour, device).cpu()
             history.append((state_cpu, pi_tensor.numpy(), target_q, current_colour, action, valid_moves))
@@ -415,6 +443,9 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
     if num_opponent_games > 0:
         logger.info(f"Running {num_opponent_games} opponent-diversity game(s)...")
         for i in range(num_opponent_games):
+            if _check_shutdown():
+                logger.info("Shutdown requested during opponent games. Saving partial results...")
+                break
             winner = play_vs_agent(model, buffer, mcts_simulations=mcts_simulations)
             finished_winners.append(winner)
             print(f"Opponent game {i+1}/{num_opponent_games} done (winner={winner})     ", end='\r')
@@ -431,9 +462,18 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
                 'root': Node(0)
             })
 
-        mcts = BatchedMCTS(model, num_simulations=mcts_simulations, temperature=MCTS_TEMPERATURE)
+        mcts = BatchedMCTS(model, num_simulations=mcts_simulations, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE)
 
         while active_games:
+            # Check for shutdown before each batch
+            if _check_shutdown():
+                logger.info("Shutdown requested during self-play. Discarding partial games and stopping...")
+                # Do NOT save partial games: winner=None would label all moves as
+                # losses (z=-1), polluting the replay buffer with false negatives.
+                for game in active_games:
+                    recursive_free(game['root'])
+                break
+                
             batch_pis = mcts.search(active_games)
 
             next_active = []
@@ -451,11 +491,11 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
 
                 valid_moves = get_valid_moves(game['board'], game['turn'])
 
-                # High temp for first N moves, then greedy to finish strong
-                temp = TEMP_HIGH if game['turn'] < TEMP_HIGH_TURNS else TEMP_MID if game['turn'] < TEMP_MID_TURNS else TEMP_LOW
-
-                if temp == 0.1:
-                    action = torch.argmax(pi).item()
+                # Always sample — even at low temp the distribution is already sharp.
+                # Controlled swap exposure: on turn 2 occasionally force a swap so the
+                # model sees both swap and no-swap outcomes in its training data.
+                if game['turn'] == 2 and 121 in valid_moves and random.random() < 0.3:
+                    action = 121  # force swap ~30% of the time on turn 2
                 else:
                     action = torch.multinomial(pi, 1).item()
 
@@ -536,6 +576,11 @@ def evaluate_batched(temp_model, best_model, num_games=NUM_GAMES_EVAL, eval_sims
     active_games = games
     
     while active_games:
+        # Check for shutdown before each evaluation batch
+        if _check_shutdown():
+            logger.info("Shutdown requested during evaluation. Returning current results...")
+            break
+            
         # 1. SPLIT THE WORKLOAD
         # Who is moving right now?
         temp_batch = [g for g in active_games if (g['colour'] == Colour.RED and g['temp_is_red']) 
@@ -545,13 +590,13 @@ def evaluate_batched(temp_model, best_model, num_games=NUM_GAMES_EVAL, eval_sims
         # 2. BATCHED SEARCH (No Noise, Low Temperature)
         # We reuse your BatchedMCTS class
         if temp_batch:
-            mcts_temp = BatchedMCTS(temp_model, num_simulations=eval_sims, temperature=MCTS_TEMPERATURE_EVAL, add_noise=False)
+            mcts_temp = BatchedMCTS(temp_model, num_simulations=eval_sims, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE_EVAL, add_noise=False)
             batch_pis_temp = mcts_temp.search(temp_batch)
             for idx, g in enumerate(temp_batch):
                 g['pi'] = batch_pis_temp[idx]
 
         if best_batch:
-            mcts_best = BatchedMCTS(best_model, num_simulations=eval_sims, temperature=MCTS_TEMPERATURE_EVAL, add_noise=False)
+            mcts_best = BatchedMCTS(best_model, num_simulations=eval_sims, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE_EVAL, add_noise=False)
             batch_pis_best = mcts_best.search(best_batch)
             for idx, g in enumerate(best_batch):
                 g['pi'] = batch_pis_best[idx]
@@ -559,7 +604,10 @@ def evaluate_batched(temp_model, best_model, num_games=NUM_GAMES_EVAL, eval_sims
         # 3. APPLY MOVES
         next_active = []
         for g in active_games:
-            action = torch.argmax(g['pi']).item() # Always greedy in eval
+            # BatchedMCTS already applies MCTS_TEMPERATURE_EVAL when building the
+            # visit-count distribution, so g['pi'] is already appropriately sharpened.
+            # Sample directly — no second sharpening (that would be double-application).
+            action = torch.multinomial(g['pi'], 1).item()
             new_board, next_col, next_turn, is_term, win = apply_move(
                 g['board'], g['colour'], g['turn'], action
             )
@@ -587,14 +635,24 @@ def evaluate_batched(temp_model, best_model, num_games=NUM_GAMES_EVAL, eval_sims
         active_games = next_active
 
     # 4. CALCULATE WIN RATE
+    # Exclude draws: a draw is neither a win nor a loss for either model, so
+    # counting it as a loss for the temp model biases the threshold downward.
     temp_wins = 0
+    decided = 0
     for g in games:
+        if g['winner'] is None:
+            continue  # draw — exclude from denominator
+        decided += 1
         if (g['winner'] == Colour.RED and g['temp_is_red']) or \
            (g['winner'] == Colour.BLUE and not g['temp_is_red']):
             temp_wins += 1
 
-    win_rate = temp_wins / num_games
-    logger.info(f"Evaluator: Temp model win rate: {win_rate*100:.1f}%")
+    effective_games = decided if decided > 0 else num_games
+    win_rate = temp_wins / effective_games
+    logger.info(
+        f"Evaluator: Temp model win rate: {win_rate*100:.1f}% "
+        f"({temp_wins}/{effective_games} decided, {num_games - decided} draw(s))"
+    )
     del games
     del active_games
     gc.collect()
@@ -604,7 +662,34 @@ def evaluate_batched(temp_model, best_model, num_games=NUM_GAMES_EVAL, eval_sims
     
     return win_rate >= EVAL_WIN_RATE_THRESHOLD
 
+
+def _save_and_exit(best_model, trainer, buffer, start_iteration, current_epoch):
+    """Save all state and exit gracefully."""
+    try:
+        # Save the replay buffer
+        buffer.save("agents/cem/buffer.pt")
+        logger.info("Replay buffer saved.")
+        
+        # Save model checkpoint
+        trainer.save_checkpoint(current_epoch + 1, path="agents/cem/")
+        torch.save({
+            'iteration': current_epoch + 1,
+            'model_state_dict': best_model.state_dict(),
+            'optimizer_state_dict': trainer.optimizer.state_dict(),
+        }, "agents/cem/best_model.pt")
+        logger.info("Model checkpoint saved.")
+        
+        logger.info(f"Graceful shutdown complete. Reached epoch {current_epoch + 1}.")
+    except Exception as e:
+        logger.error(f"Error during graceful shutdown: {e}")
+    
+    sys.exit(0)
+
 if __name__ == "__main__":
+    # Register signal handlers for graceful termination
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
@@ -638,14 +723,13 @@ if __name__ == "__main__":
         
         # Train for some iterations on the buffer
         # We need enough 6-element tuples (with target_q) to train
-        valid_buffer_size = sum(1 for b in buffer.buffer if len(b) == 6)
+        valid_buffer_size = len(buffer)
         if valid_buffer_size >= BATCH_SIZE:
-            random.shuffle(buffer.buffer)
             total_loss = total_p = total_v = total_q = 0.0
             
             for b in range(TRAINING_STEPS):
                 states, pis, qs, zs, actions, valid_moves = buffer.sample(BATCH_SIZE)
-                loss, p_loss, v_loss, q_loss = temp_trainer.train_step(states, pis, qs, zs, actions, valid_moves)
+                loss, p_loss, v_loss, q_loss = temp_trainer.train_step(states, pis, qs, zs, valid_moves)
                 total_loss += loss
                 total_p += p_loss
                 total_v += v_loss
@@ -676,3 +760,13 @@ if __name__ == "__main__":
                 temp_model.load_state_dict(best_model.state_dict())
 
         print("\n")
+        
+        # Check for graceful shutdown after each epoch
+        if _check_shutdown():
+            logger.info("Shutdown requested. Saving state and exiting...")
+            _save_and_exit(best_model, trainer, buffer, iteration, epoch)
+    
+    logger.info("Training completed normally.")
+
+
+

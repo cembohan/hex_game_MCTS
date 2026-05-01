@@ -117,7 +117,7 @@ def encode_state(board, current_colour, device, out_tensor=None):
     return out_tensor
 
 class MCTS:
-    def __init__(self, model, num_simulations=400, c_puct=1.0, temperature=1.0):
+    def __init__(self, model, num_simulations=400, c_puct=2.0, temperature=1.0):
         self.model = model
         self.num_simulations = num_simulations
         self.c_puct = c_puct
@@ -129,6 +129,7 @@ class MCTS:
     @torch.no_grad()
     def search(self, board, current_colour, turn):
         root = Node(0)
+        self.last_root = root  # Expose root for Q-target extraction by callers
         
         # Initial expansion
         state_tensor = encode_state(board, current_colour, self.device, out_tensor=self.state_buffer)
@@ -139,7 +140,7 @@ class MCTS:
         valid_moves = get_valid_moves(board, turn)
         
         if len(valid_moves) > 0:
-            k = min(12, len(valid_moves))  # Reduced from 20 to save memory
+            k = min(20, len(valid_moves))  # top-20: reduces risk of permanently pruning optimal moves
             top_k = np.argsort(policy_probs[valid_moves])[-k:]
             top_k_moves = [valid_moves[idx] for idx in top_k]
             
@@ -206,7 +207,7 @@ class MCTS:
                 if len(valid_moves) == 0:
                     value = 0 
                 else:
-                    k = min(12, len(valid_moves))  # Reduced from 20
+                    k = min(20, len(valid_moves))  # top-20 to match root expansion
                     top_k = np.argsort(policy_probs[valid_moves])[-k:]
                     top_k_moves = [valid_moves[idx] for idx in top_k]
                     
@@ -299,7 +300,7 @@ class BatchedMCTS:
                     p_probs = policy_probs[idx_idx]
                     q_vals = q_values[idx_idx]
                     
-                    k = min(12, len(valid_moves))  # Reduced from 20
+                    k = min(20, len(valid_moves))  # top-20 to match root expansion
                     top_k = np.argsort(p_probs[valid_moves])[-k:]
                     top_k_moves = [valid_moves[idx] for idx in top_k]
                     
@@ -399,7 +400,7 @@ class BatchedMCTS:
                     if not valid_moves:
                         value = 0.0
                     else:
-                        k = min(12, len(valid_moves))  # Reduced from 20
+                        k = min(20, len(valid_moves))  # top-20 to match root expansion
                         top_k = np.argsort(p_probs[valid_moves])[-k:]
                         top_k_moves = [valid_moves[idx] for idx in top_k]
                         
