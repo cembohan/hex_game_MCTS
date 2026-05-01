@@ -3,6 +3,7 @@ import copy
 import torch
 import torch.nn.functional as F
 import numpy as np
+import weakref
 
 from src.Board import Board
 from src.Colour import Colour
@@ -14,7 +15,9 @@ class Node:
         self.visit_count = 0
         self.value_sum = 0
         self.q_prior = 0.0
-        self.parent = parent
+        
+        # FIX 1: Use weakref to break cyclic references
+        self.parent = weakref.ref(parent) if parent is not None else None
         self.action_from_parent = action_from_parent
         
         self.is_expanded = False
@@ -23,7 +26,9 @@ class Node:
         self.children_values = np.zeros(122, dtype=np.float32)
         self.children_q_priors = np.zeros(122, dtype=np.float32)
         self.children_exists = np.zeros(122, dtype=bool)
-        self.children_nodes = np.empty(122, dtype=object)
+        
+        # FIX 2: Use standard lists instead of uninitialized numpy object arrays
+        self.children_nodes = [None] * 122
         
     def value(self):
         if self.visit_count == 0:
@@ -134,7 +139,7 @@ class MCTS:
         valid_moves = get_valid_moves(board, turn)
         
         if len(valid_moves) > 0:
-            k = min(20, len(valid_moves))
+            k = min(12, len(valid_moves))  # Reduced from 20 to save memory
             top_k = np.argsort(policy_probs[valid_moves])[-k:]
             top_k_moves = [valid_moves[idx] for idx in top_k]
             
@@ -201,7 +206,7 @@ class MCTS:
                 if len(valid_moves) == 0:
                     value = 0 
                 else:
-                    k = min(20, len(valid_moves))
+                    k = min(12, len(valid_moves))  # Reduced from 20
                     top_k = np.argsort(policy_probs[valid_moves])[-k:]
                     top_k_moves = [valid_moves[idx] for idx in top_k]
                     
@@ -221,11 +226,16 @@ class MCTS:
             while node is not None:
                 node.value_sum += value
                 node.visit_count += 1
-                if node.parent is not None:
-                    node.parent.children_values[node.action_from_parent] += value
-                    node.parent.children_visits[node.action_from_parent] += 1
+                
+                # Resolve the weak reference to access the actual parent object
+                parent = node.parent() if node.parent is not None else None
+                
+                if parent is not None:
+                    parent.children_values[node.action_from_parent] += value
+                    parent.children_visits[node.action_from_parent] += 1
+                    
                 value = -value # Invert value for the other player
-                node = node.parent
+                node = parent  # Move up the tree
                 
             release_board(sim_board)
                 
@@ -289,7 +299,7 @@ class BatchedMCTS:
                     p_probs = policy_probs[idx_idx]
                     q_vals = q_values[idx_idx]
                     
-                    k = min(20, len(valid_moves))
+                    k = min(12, len(valid_moves))  # Reduced from 20
                     top_k = np.argsort(p_probs[valid_moves])[-k:]
                     top_k_moves = [valid_moves[idx] for idx in top_k]
                     
@@ -389,7 +399,7 @@ class BatchedMCTS:
                     if not valid_moves:
                         value = 0.0
                     else:
-                        k = min(20, len(valid_moves))
+                        k = min(12, len(valid_moves))  # Reduced from 20
                         top_k = np.argsort(p_probs[valid_moves])[-k:]
                         top_k_moves = [valid_moves[idx] for idx in top_k]
                         
@@ -411,9 +421,14 @@ class BatchedMCTS:
                 for node in reversed(path):
                     node.value_sum += value
                     node.visit_count += 1
-                    if node.parent is not None:
-                        node.parent.children_values[node.action_from_parent] += value
-                        node.parent.children_visits[node.action_from_parent] += 1
+                    
+                    # Resolve the weak reference
+                    parent = node.parent() if node.parent is not None else None
+                    
+                    if parent is not None:
+                        parent.children_values[node.action_from_parent] += value
+                        parent.children_visits[node.action_from_parent] += 1
+                        
                     value = -value
                     
             for sim_board in sim_boards:

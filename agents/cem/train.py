@@ -5,6 +5,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 import time
+import gc
 from collections import deque
 
 from src.Board import Board
@@ -14,6 +15,15 @@ from agents.cem.agent1 import Hex3HNN
 from agents.cem.mcts import MCTS, BatchedMCTS, Node, encode_state, get_valid_moves, apply_move
 
 import logging
+#TODO - Add graceful termination
+#TODO - Gather all hyperparameters into a config file or at least a single section at the top for easy tuning
+#TODO - Add notifications on epoch completion (discord, desktop etc.)
+#TODO: Make one every 10 games use swap rule
+#TODO: replay buffer wastes RAM by storing PyTorch tensors. We should convert to numpy before saving and back to tensor when sampling.
+#TODO: BatchedMCTS is currently a bottleneck due to PyTorch overhead. implement iterative backprop. look to replace "search_paths.append(path)"
+#TODO: "g['root'] = Node(0)" is a fallback that should never be hit. If it is, we leak the old subtree entirely. can consider g['root'] = None
+#TODO: overall look into memory leaks. might look into how alpha-zero implementations handle this
+
 
 os.makedirs("agents/cem", exist_ok=True)
 logger = logging.getLogger("HexTraining")
@@ -29,32 +39,32 @@ ch = logging.StreamHandler()
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
+import pickle # Ensure this is imported at the top
+
 class ReplayBuffer:
     def __init__(self, capacity=100000): # Increased capacity
         self.buffer = deque(maxlen=capacity)
         
     def save_game(self, game_history, winner_colour):
-        # game_history is a list of (state_tensor, pi, target_q, current_colour, action, valid_moves)
         for state, pi, target_q, current_colour, action, valid_moves in game_history:
-            # Value is +1 if the player who made the move won, else -1
             z = 1.0 if current_colour == winner_colour else -1.0
-            self.buffer.append((state, pi, target_q, z, action, valid_moves))
             
-            # Data Augmentation: Hex 180-degree rotation
-            # For player-relative encoding, we just rotate the spatial dimensions
-            rotated_state = torch.rot90(state, 2, [2, 3])
+            # 1. Convert state to numpy to avoid massive PyTorch storage overhead
+            state_np = state.numpy() if isinstance(state, torch.Tensor) else state
             
-            # Rotate the policy (excluding the swap move at the last index)
+            self.buffer.append((state_np, pi, target_q, z, action, valid_moves))
+            
+            # Data Augmentation: Hex 180-degree rotation using NumPy
+            rotated_state_np = np.rot90(state_np, 2, axes=(2, 3)).copy()
+            
             pi_board = pi[:-1].reshape(11, 11)
             rotated_pi_board = np.rot90(pi_board, 2)
             rotated_pi = np.append(rotated_pi_board.flatten(), pi[-1]) 
             
-            # Rotate target_q exactly like policy
             q_board = target_q[:-1].reshape(11, 11)
             rotated_q_board = np.rot90(q_board, 2)
             rotated_q = np.append(rotated_q_board.flatten(), target_q[-1])
             
-            # Action adjustment for rotated board
             if action != 121:
                 x, y = divmod(action, 11)
                 rx, ry = 10 - x, 10 - y
@@ -62,7 +72,6 @@ class ReplayBuffer:
             else:
                 rotated_action = 121
                 
-            # valid moves adjustment
             rotated_valid_moves = []
             for vm in valid_moves:
                 if vm != 121:
@@ -72,10 +81,9 @@ class ReplayBuffer:
                 else:
                     rotated_valid_moves.append(121)
                     
-            self.buffer.append((rotated_state, rotated_pi, rotated_q, z, rotated_action, rotated_valid_moves))
+            self.buffer.append((rotated_state_np, rotated_pi, rotated_q, z, rotated_action, rotated_valid_moves))
             
     def sample(self, batch_size):
-        # Filter out old 5-element buffer entries if mixing buffers
         valid_buffer = [b for b in self.buffer if len(b) == 6]
         if not valid_buffer:
             raise ValueError("Buffer has no 6-element tuples (with target_q). Please delete buffer.pt and restart.")
@@ -83,11 +91,11 @@ class ReplayBuffer:
         
         states, pis, qs, zs, actions, valid_moves_list = zip(*batch)
         
-        # Concat states
-        states_tensor = torch.cat([s.cpu() for s in states], dim=0) # (Batch, 3, 11, 11)
-        pis_tensor = torch.tensor(np.array(pis), dtype=torch.float32) # (Batch, 122)
-        qs_tensor = torch.tensor(np.array(qs), dtype=torch.float32) # (Batch, 122)
-        zs_tensor = torch.tensor(zs, dtype=torch.float32) # (Batch,)
+        # 2. Concat numpy arrays first, then map to tensor (much faster and memory efficient)
+        states_tensor = torch.tensor(np.concatenate(states, axis=0), dtype=torch.float32) 
+        pis_tensor = torch.tensor(np.array(pis), dtype=torch.float32) 
+        qs_tensor = torch.tensor(np.array(qs), dtype=torch.float32) 
+        zs_tensor = torch.tensor(zs, dtype=torch.float32) 
         
         return states_tensor, pis_tensor, qs_tensor, zs_tensor, actions, valid_moves_list
         
@@ -95,13 +103,29 @@ class ReplayBuffer:
         return len(self.buffer)
         
     def save(self, filename):
-        torch.save(list(self.buffer), filename)
+        # 3. Use standard pickle for lists of standard python/numpy objects
+        with open(filename, 'wb') as f:
+            pickle.dump(list(self.buffer), f)
         
     def load(self, filename):
         if os.path.isfile(filename):
-            loaded = torch.load(filename, map_location="cpu", weights_only=False)
-            self.buffer = deque(loaded, maxlen=self.buffer.maxlen)
-            print(f"Loaded {len(self.buffer)} games from {filename}")
+            try:
+                # Try loading the new pickle format first
+                with open(filename, 'rb') as f:
+                    loaded = pickle.load(f)
+            except Exception:
+                # Fallback: Load your old PyTorch format buffer
+                loaded = torch.load(filename, map_location="cpu", weights_only=False)
+            
+            # 4. Clean up any lingering PyTorch tensors from an older save file
+            cleaned_loaded = []
+            for item in loaded:
+                state, pi, target_q, z, action, valid_moves = item
+                state_np = state.numpy() if isinstance(state, torch.Tensor) else state
+                cleaned_loaded.append((state_np, pi, target_q, z, action, valid_moves))
+                
+            self.buffer = deque(cleaned_loaded, maxlen=self.buffer.maxlen)
+            print(f"Loaded {len(self.buffer)} games from {filename} and normalized states.")
 
 
 class HexTrainer:
@@ -171,7 +195,27 @@ class HexTrainer:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             return checkpoint.get('iteration', 0)
         return 0
-
+    
+def recursive_free(node):
+    if node is None:
+        return
+    
+    # 1. Break parent reference
+    node.parent = None
+    
+    # 2. Recursively free all children
+    if hasattr(node, 'children_nodes') and node.children_nodes is not None:
+        for child in node.children_nodes:
+            if child is not None:
+                recursive_free(child)
+                
+    # 3. Clear arrays
+    node.children_nodes = None
+    node.children_priors = None
+    node.children_visits = None
+    node.children_values = None
+    node.children_q_priors = None
+    node.children_exists = None
 
 def self_play(model, buffer, num_games=10, mcts_simulations=100):
     model.eval()
@@ -228,16 +272,28 @@ def self_play(model, buffer, num_games=10, mcts_simulations=100):
             if is_terminal:
                 finished_winners.append(winner)
                 buffer.save_game(game['history'], winner)
+                
+                recursive_free(game['root'])
+                game['root'] = None
+                game['history'].clear()
+                
+                continue
             else:
                 game['board'] = new_board
                 game['colour'] = next_col
                 game['turn'] = next_turn
                 # Keep the tree! Step into the child node for the chosen action.
                 if game['root'].children_exists[action] and game['root'].children_nodes[action] is not None:
-                    game['root'] = game['root'].children_nodes[action]
-                    game['root'].parent = None # Cut off the old parent to save memory
+                    old_root = game['root']
+                    new_root = old_root.children_nodes[action]
+                    game['root'] = new_root
+                    new_root.parent = None
+                    old_root.children_nodes[action] = None
+                    # Break references so GC can clean up old tree
+                    recursive_free(old_root)
+                    del old_root
                 else:
-                    game['root'] = Node(0) # Only fallback if something weird happens
+                    game['root'] = Node(0)  # Only fallback if something weird happens
                 next_active.append(game)
                 
         active_games = next_active
@@ -247,10 +303,17 @@ def self_play(model, buffer, num_games=10, mcts_simulations=100):
     blue_wins = sum(1 for w in finished_winners if w == Colour.BLUE)
     draws = sum(1 for w in finished_winners if w is None)
     logger.info(f"Self-Play Batch Completed. RED Wins: {red_wins}, BLUE Wins: {blue_wins}, Draws: {draws}")
+    
+    
+    del active_games
+    del finished_winners
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
         
     return buffer
 
-def evaluate_batched(temp_model, best_model, num_games=20, eval_sims=50):
+def evaluate_batched(temp_model, best_model, num_games=30, eval_sims=100):
     temp_model.eval()
     best_model.eval()
     
@@ -304,10 +367,17 @@ def evaluate_batched(temp_model, best_model, num_games=20, eval_sims=50):
             if not is_term:
                 # Keep the tree! Step into the child node for the chosen action.
                 if g['root'].children_exists[action] and g['root'].children_nodes[action] is not None:
-                    g['root'] = g['root'].children_nodes[action]
-                    g['root'].parent = None # Cut off the old parent to save memory
+                    old_root = g['root']
+                    new_root = old_root.children_nodes[action]
+                    g['root'] = new_root
+                    # --- THE FIX: Detach the new root here too ---
+                    old_root.children_nodes[action] = None
+                    
+                    # Break references so GC can clean up old tree
+                    recursive_free(old_root)
+                    del old_root
                 else:
-                    g['root'] = Node(0) # Only fallback if something weird happens
+                    g['root'] = Node(0)  # Only fallback if something weird happens
                 
                 next_active.append(g)
         
@@ -322,7 +392,14 @@ def evaluate_batched(temp_model, best_model, num_games=20, eval_sims=50):
 
     win_rate = temp_wins / num_games
     logger.info(f"Evaluator: Temp model win rate: {win_rate*100:.1f}%")
-    return win_rate > 0.51
+    del games
+    del active_games
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return win_rate > 0.55
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -334,30 +411,29 @@ if __name__ == "__main__":
     trainer = HexTrainer(best_model)
     iteration = trainer.load_checkpoint("agents/cem/best_model.pt")
     
+    temp_model = Hex3HNN(board_size=11).to(device)
+    temp_trainer = HexTrainer(temp_model)
+    
+    buffer = ReplayBuffer()
+    buffer.load("agents/cem/buffer.pt")
+    
     # Initialize ReplayBuffer globally so it persists across epochs
     buffer = ReplayBuffer()
     buffer.load("agents/cem/buffer.pt")
     
     # Training Loop
-    EPOCHS = 100
+    EPOCHS = 300
     GAMES_PER_EPOCH = 12
     BATCH_SIZE = 256
     TRAINING_STEPS = 200
-    EVAL_EVERY = 3  # Only evaluate every N epochs to save time
+    EVAL_EVERY = 10  # Only evaluate every N epochs to save time
+    num_games_eval = 24
     
     for epoch in range(iteration, iteration + EPOCHS):
         logger.info(f"--- Epoch {epoch+1} ---")
+        sp_sims = 30
+        eval_sims = 150
         
-        # MCTS Simulation logic
-        if epoch < 10:
-            sp_sims = 30
-            eval_sims = 50
-        elif epoch < 50:
-            sp_sims = 30
-            eval_sims = 30
-        else:
-            sp_sims = 100
-            eval_sims = 200
             
         # 1. Self Play
         logger.info(f"Starting Self-Play (sims={sp_sims})...")
@@ -368,9 +444,7 @@ if __name__ == "__main__":
         
         # 2. Train Temp Model
         logger.info("Starting Training...")
-        temp_model = Hex3HNN(board_size=11).to(device)
         temp_model.load_state_dict(best_model.state_dict())
-        temp_trainer = HexTrainer(temp_model)
         
         # Train for some iterations on the buffer
         # We need enough 6-element tuples (with target_q) to train
@@ -393,7 +467,7 @@ if __name__ == "__main__":
         # 3. Evaluate (only every EVAL_EVERY epochs)
         if (epoch - iteration) % EVAL_EVERY == 0:
             logger.info(f"Evaluating (sims={eval_sims})...")
-            is_better = evaluate_batched(temp_model, best_model, num_games=20, eval_sims=eval_sims)
+            is_better = evaluate_batched(temp_model, best_model, num_games_eval, eval_sims=eval_sims)
             
             if is_better:
                 logger.info("Temp model is better! Saving as new best_model.")
@@ -407,7 +481,6 @@ if __name__ == "__main__":
             else:
                 logger.info("Temp model rejected. Keeping previous best_model.")
         else:
-            # Still copy temp model weights to best_model for next iteration's self-play
-            best_model.load_state_dict(temp_model.state_dict())
-            
+            pass
+
         print("\n")

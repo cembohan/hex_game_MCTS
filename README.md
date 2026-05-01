@@ -38,6 +38,7 @@ By default, two `agents/DefaultAgents/NaiveAgent.py` agent will play against eac
 help message use `python3 Hex.py --help`.
 python3 Hex.py -p1 "agents.cem.agent1 Agent1" -p2 "agents.DefaultAgents.NaiveAgent NaiveAgent" -v
 python3 Hex.py -p1 "agents.cem.agent1 Agent1" -p2 "agents.MCTSAgent.MCTSAgent MCTSAgent" -v
+python Hex.py -p1 "agents.cem.agent1 Agent1" -p2 "agents.TestAgents.ValidAgent ValidAgent" -v
 
 To exit the docker container you can simply do `exit`. This will stop the container.
 
