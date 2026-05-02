@@ -96,12 +96,26 @@ class Hex3HNN(nn.Module):
 
 
 class Agent1(AgentBase):
-    def __init__(self, colour: Colour):
+    def __init__(self, colour: Colour, board_size: int = None):
         super().__init__(colour)
-        self.board_size = 11
         
         # Check for GPU
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Determine board size
+        if board_size is None:
+            # Try to infer from checkpoint
+            model_path = os.path.join(os.path.dirname(__file__), "best_model.pt")
+            if os.path.isfile(model_path):
+                try:
+                    checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+                    if 'board_size' in checkpoint:
+                        board_size = checkpoint['board_size']
+                except Exception:
+                    pass
+        
+        # Final fallback to 11
+        self.board_size = board_size if board_size is not None else 11
         
         # Initialize the 3HNN architecture and move to device
         self.model = Hex3HNN(board_size=self.board_size).to(self.device)
@@ -110,7 +124,7 @@ class Agent1(AgentBase):
         # Load best model if exists
         model_path = os.path.join(os.path.dirname(__file__), "best_model.pt")
         if os.path.isfile(model_path):
-            checkpoint = torch.load(model_path, map_location=self.device)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             self.model.load_state_dict(checkpoint['model_state_dict'])
     
     def make_move(self, turn: int, board: Board, opp_move: Move | None) -> Move:

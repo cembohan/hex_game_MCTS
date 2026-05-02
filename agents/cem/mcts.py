@@ -9,6 +9,16 @@ from src.Board import Board
 from src.Colour import Colour
 from src.Move import Move
 
+# Global board configuration
+BOARD_SIZE = 11
+NUM_ACTIONS = 122  # board_size * board_size + 1
+
+def init_board_config(board_size):
+    """Initialize MCTS with the target board size. Call this before creating MCTS instances."""
+    global BOARD_SIZE, NUM_ACTIONS
+    BOARD_SIZE = board_size
+    NUM_ACTIONS = board_size * board_size + 1
+
 class Node:
     def __init__(self, prior, parent=None, action_from_parent=None):
         self.prior = prior
@@ -21,14 +31,14 @@ class Node:
         self.action_from_parent = action_from_parent
         
         self.is_expanded = False
-        self.children_priors = np.zeros(122, dtype=np.float32)
-        self.children_visits = np.zeros(122, dtype=np.int32)
-        self.children_values = np.zeros(122, dtype=np.float32)
-        self.children_q_priors = np.zeros(122, dtype=np.float32)
-        self.children_exists = np.zeros(122, dtype=bool)
+        self.children_priors = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        self.children_visits = np.zeros(NUM_ACTIONS, dtype=np.int32)
+        self.children_values = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        self.children_q_priors = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        self.children_exists = np.zeros(NUM_ACTIONS, dtype=bool)
         
         # FIX 2: Use standard lists instead of uninitialized numpy object arrays
-        self.children_nodes = [None] * 122
+        self.children_nodes = [None] * NUM_ACTIONS
         
     def value(self):
         if self.visit_count == 0:
@@ -175,7 +185,7 @@ class MCTS:
                 mask = node.children_exists
                 visits = node.children_visits
                 
-                q = np.zeros(122, dtype=np.float32)
+                q = np.zeros(NUM_ACTIONS, dtype=np.float32)
                 visited = visits > 0
                 q[visited] = node.children_values[visited] / visits[visited]
                 q[~visited] = node.children_q_priors[~visited]
@@ -241,8 +251,8 @@ class MCTS:
             release_board(sim_board)
                 
         # Calculate visit probabilities
-        action_probs = torch.zeros(self.model.board_size * self.model.board_size + 1)
-        for a in range(122):
+        action_probs = torch.zeros(NUM_ACTIONS)
+        for a in range(NUM_ACTIONS):
             if root.children_exists[a]:
                 action_probs[a] = root.children_visits[a]
             
@@ -345,7 +355,7 @@ class BatchedMCTS:
                     mask = node.children_exists
                     visits = node.children_visits
                     
-                    q = np.zeros(122, dtype=np.float32)
+                    q = np.zeros(NUM_ACTIONS, dtype=np.float32)
                     visited = visits > 0
                     q[visited] = node.children_values[visited] / visits[visited]
                     q[~visited] = node.children_q_priors[~visited]
@@ -438,9 +448,9 @@ class BatchedMCTS:
         # 3. Final Action Selection Probs
         batch_pis = []
         for i in range(num_games):
-            action_probs = torch.zeros(self.board_size * self.board_size + 1)
+            action_probs = torch.zeros(NUM_ACTIONS)
             root = active_games[i]['root']
-            for a in range(122):
+            for a in range(NUM_ACTIONS):
                 if root.children_exists[a]:
                     action_probs[a] = root.children_visits[a]
                 

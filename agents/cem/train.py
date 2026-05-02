@@ -29,14 +29,12 @@ from src.Colour import Colour
 from src.Move import Move
 
 from agents.cem.agent1 import Hex3HNN
-from agents.cem.mcts import MCTS, BatchedMCTS, Node, encode_state, get_valid_moves, apply_move
+from agents.cem.mcts import MCTS, BatchedMCTS, Node, encode_state, get_valid_moves, apply_move, init_board_config
 
 import logging
 #TODO - Add notifications on epoch completion (discord, desktop etc.)
-#TODO: replay buffer wastes RAM by storing PyTorch tensors. We should convert to numpy before saving and back to tensor when sampling.
-#TODO: BatchedMCTS is currently a bottleneck due to PyTorch overhead. implement iterative backprop. look to replace "search_paths.append(path)"
-#TODO: "g['root'] = Node(0)" is a fallback that should never be hit. If it is, we leak the old subtree entirely. can consider g['root'] = None
-#TODO: overall look into memory leaks. might look into how alpha-zero implementations handle this
+#TODO - (consider) Occasionally start the model from a random node in the MCTS tree instead of the root, to expose it to a wider variety of positions and avoid overfitting to the early game.
+#TODO - (must do) Make evals log to a separate file with detailed results (without the mess of self-play logs)
 
 
 # =============================================================================
@@ -85,20 +83,71 @@ EVAL_WIN_RATE_THRESHOLD = 0.55  # Win rate needed to replace best model (55%)
 # --- Board Size (fixed for now) ---
 BOARD_SIZE = 11
 
+# --- Folder Paths ---
+CHECKPOINT_DIR = "agents/cem/checkpoints/"
+BUFFER_DIR = "agents/cem/buffers/"
+LOG_FILE = "agents/cem/logs/training.log"
+EVAL_LOG_FILE = "agents/cem/logs/evals.log"
 
-os.makedirs("agents/cem", exist_ok=True)
+# Logger is set up lazily via _setup_logging() so that configure() can
+# change LOG_FILE / CHECKPOINT_DIR / BUFFER_DIR before anything runs.
 logger = logging.getLogger("HexTraining")
-logger.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-formatter.converter = time.localtime
+# Dedicated logger for evaluation results — routed to a separate file.
+eval_logger = logging.getLogger("HexEval")
 
-fh = logging.FileHandler("agents/cem/training.log")
-fh.setFormatter(formatter)
-logger.addHandler(fh)
 
-ch = logging.StreamHandler()
-ch.setFormatter(formatter)
-logger.addHandler(ch)
+def configure(**overrides):
+    """Override any module-level constant before training starts.
+
+    Example::
+        import agents.cem.train as train
+        train.configure(BOARD_SIZE=5, CHECKPOINT_DIR="agents/cem/checkpoints_small/")
+        train.run_training()
+    """
+    g = globals()
+    for key, value in overrides.items():
+        if key not in g:
+            raise KeyError(f"Unknown config key: {key}")
+        g[key] = value
+
+
+def _setup_logging():
+    """Initialise board config, directories, and logging handlers.
+
+    Must be called once *after* any configure() call.
+    """
+    init_board_config(BOARD_SIZE)
+
+    os.makedirs("agents/cem", exist_ok=True)
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(BUFFER_DIR, exist_ok=True)
+
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    formatter.converter = time.localtime
+
+    # --- Main training logger (file + console) ---
+    logger.setLevel(logging.INFO)
+    # Avoid duplicate handlers when called more than once
+    if not logger.handlers:
+        fh = logging.FileHandler(LOG_FILE)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+        ch = logging.StreamHandler()
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+
+    # --- Dedicated eval logger (file only, no console spam) ---
+    eval_logger.setLevel(logging.INFO)
+    # Prevent propagation so eval entries don't double-write to root handlers
+    eval_logger.propagate = False
+    if not eval_logger.handlers:
+        eval_fh = logging.FileHandler(EVAL_LOG_FILE)
+        eval_fh.setFormatter(formatter)
+        eval_logger.addHandler(eval_fh)
 
 import pickle # Ensure this is imported at the top
 
@@ -118,29 +167,32 @@ class ReplayBuffer:
             # Data Augmentation: Hex 180-degree rotation using NumPy
             rotated_state_np = np.rot90(state_np, 2, axes=(2, 3)).copy()
             
-            pi_board = pi[:-1].reshape(11, 11)
+            bs = BOARD_SIZE
+            swap_idx = bs * bs
+
+            pi_board = pi[:-1].reshape(bs, bs)
             rotated_pi_board = np.rot90(pi_board, 2)
             rotated_pi = np.append(rotated_pi_board.flatten(), pi[-1]) 
             
-            q_board = target_q[:-1].reshape(11, 11)
+            q_board = target_q[:-1].reshape(bs, bs)
             rotated_q_board = np.rot90(q_board, 2)
             rotated_q = np.append(rotated_q_board.flatten(), target_q[-1])
             
-            if action != 121:
-                x, y = divmod(action, 11)
-                rx, ry = 10 - x, 10 - y
-                rotated_action = rx * 11 + ry
+            if action != swap_idx:
+                x, y = divmod(action, bs)
+                rx, ry = bs - 1 - x, bs - 1 - y
+                rotated_action = rx * bs + ry
             else:
-                rotated_action = 121
+                rotated_action = swap_idx
                 
             rotated_valid_moves = []
             for vm in valid_moves:
-                if vm != 121:
-                    vx, vy = divmod(vm, 11)
-                    rx, ry = 10 - vx, 10 - vy
-                    rotated_valid_moves.append(rx * 11 + ry)
+                if vm != swap_idx:
+                    vx, vy = divmod(vm, bs)
+                    rx, ry = bs - 1 - vx, bs - 1 - vy
+                    rotated_valid_moves.append(rx * bs + ry)
                 else:
-                    rotated_valid_moves.append(121)
+                    rotated_valid_moves.append(swap_idx)
                     
             self.buffer.append((rotated_state_np, rotated_pi, rotated_q, z, rotated_action, rotated_valid_moves))
             
@@ -162,12 +214,17 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
         
-    def save(self, filename):
+    def save(self, filename=None):
+        if filename is None:
+            filename = os.path.join(BUFFER_DIR, "buffer.pt")
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
         # 3. Use standard pickle for lists of standard python/numpy objects
         with open(filename, 'wb') as f:
             pickle.dump(list(self.buffer), f)
         
-    def load(self, filename):
+    def load(self, filename=None):
+        if filename is None:
+            filename = os.path.join(BUFFER_DIR, "buffer.pt")
         if not os.path.isfile(filename):
             print(f"No replay buffer found at {filename}. Starting with an empty buffer.")
             return
@@ -221,7 +278,7 @@ class HexTrainer:
         p_logits, v, q = self.model(states)
 
         # 1. Masking Invalid Moves in Policy
-        # Create a boolean mask of the same shape as p_logits (Batch, 122)
+        # Create a boolean mask of the same shape as p_logits (Batch, BOARD_SIZE*BOARD_SIZE+1)
         mask = torch.ones_like(p_logits, dtype=torch.bool)
         for i, valid in enumerate(valid_moves_list):
             mask[i, valid] = False # False means it IS a valid move
@@ -252,15 +309,20 @@ class HexTrainer:
 
         return total_loss.item(), p_loss.item(), v_loss.item(), q_loss.item()
 
-    def save_checkpoint(self, iteration, path="agents/cem/"):
+    def save_checkpoint(self, iteration, path=None):
+        if path is None:
+            path = CHECKPOINT_DIR
         os.makedirs(path, exist_ok=True)
         torch.save({
             'iteration': iteration,
+            'board_size': BOARD_SIZE,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
         }, os.path.join(path, f"checkpoint_{iteration}.pt"))
         
-    def load_checkpoint(self, filename):
+    def load_checkpoint(self, filename=None):
+        if filename is None:
+            filename = os.path.join(CHECKPOINT_DIR, "best_model.pt")
         if os.path.isfile(filename):
             device = next(self.model.parameters()).device
             checkpoint = torch.load(filename, map_location=device)
@@ -304,7 +366,7 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
     Returns the winner Colour (or None).
     """
     model.eval()
-    board = Board(11)
+    board = Board(BOARD_SIZE)
 
     # Randomly decide which side the model plays
     model_colour = random.choice([Colour.RED, Colour.BLUE])
@@ -332,7 +394,7 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
 
             # Extract Q-targets from MCTS root (consistent with self_play definition)
             root = mcts.last_root
-            target_q = np.zeros(122, dtype=np.float32)
+            target_q = np.zeros(BOARD_SIZE * BOARD_SIZE + 1, dtype=np.float32)
             visits = root.children_visits
             visited = visits > 0
             target_q[visited] = root.children_values[visited] / visits[visited]
@@ -348,7 +410,7 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
             history.append((state_cpu, pi_tensor.numpy(), target_q, current_colour, action, valid_moves))
 
             # Apply the model's move
-            move_obj = Move(-1, -1) if action == 121 else Move(*divmod(action, 11))
+            move_obj = Move(-1, -1) if action == BOARD_SIZE * BOARD_SIZE else Move(*divmod(action, BOARD_SIZE))
             new_board, next_col, next_turn, is_terminal, winner = apply_move(
                 board, current_colour, turn, action
             )
@@ -358,18 +420,18 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
             move_obj = opp_agent.make_move(turn, board, last_move)
 
             if move_obj.x == -1 and move_obj.y == -1:
-                # Swap move — action index 121
-                action = 121
+                # Swap move
+                action = BOARD_SIZE * BOARD_SIZE
             else:
-                action = move_obj.x * 11 + move_obj.y
+                action = move_obj.x * BOARD_SIZE + move_obj.y
 
             # Validate: if the move lands on an occupied cell, skip (play first valid)
-            if action != 121 and action not in get_valid_moves(board, turn):
+            if action != BOARD_SIZE * BOARD_SIZE and action not in get_valid_moves(board, turn):
                 valid = get_valid_moves(board, turn)
                 if not valid:
                     break  # Should not happen, but guard
                 action = valid[0]
-                move_obj = Move(*divmod(action, 11))
+                move_obj = Move(*divmod(action, BOARD_SIZE))
 
             new_board, next_col, next_turn, is_terminal, winner = apply_move(
                 board, current_colour, turn, action
@@ -383,9 +445,10 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
         if is_terminal:
             break
 
-        # Safety valve: game should never last this long on 11x11
-        if turn > 125:
-            logger.warning("play_vs_agent: hit turn limit 125 without terminal — forcing stop")
+        # Safety valve: game should never last this long
+        max_turns = BOARD_SIZE * BOARD_SIZE + 4
+        if turn > max_turns:
+            logger.warning(f"play_vs_agent: hit turn limit {max_turns} without terminal — forcing stop")
             break
 
     buffer.save_game(history, winner)
@@ -455,7 +518,7 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
         active_games = []
         for _ in range(num_self_play_games):
             active_games.append({
-                'board': Board(11),
+                'board': Board(BOARD_SIZE),
                 'colour': Colour.RED,
                 'turn': 1,
                 'history': [],
@@ -482,7 +545,7 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
                 root = game['root']
 
                 # Extract true MCTS Q-values
-                target_q = np.zeros(122, dtype=np.float32)
+                target_q = np.zeros(BOARD_SIZE * BOARD_SIZE + 1, dtype=np.float32)
                 visits = root.children_visits
                 visited = visits > 0
                 target_q[visited] = root.children_values[visited] / visits[visited]
@@ -503,10 +566,9 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
                     pi = pi ** (1.0 / temp)
                     pi = pi / pi.sum()
 
-                # Controlled swap exposure: on turn 2 occasionally force a swap so the
-                # model sees both swap and no-swap outcomes in its training data.
-                if turn == 2 and 121 in valid_moves and random.random() < 0.3:
-                    action = 121  # force swap ~30% of the time on turn 2
+                swap_idx = BOARD_SIZE * BOARD_SIZE
+                if turn == 2 and swap_idx in valid_moves and random.random() < 0.3:
+                    action = swap_idx  # force swap ~30% of the time on turn 2
                 else:
                     action = torch.multinomial(pi, 1).item()
 
@@ -575,7 +637,7 @@ def evaluate_batched(temp_model, best_model, num_games=NUM_GAMES_EVAL, eval_sims
     games = []
     for i in range(num_games):
         games.append({
-            'board': Board(11),
+            'board': Board(BOARD_SIZE),
             'colour': Colour.RED,
             'turn': 1,
             'temp_is_red': (i < num_games // 2), # Balanced sides
@@ -649,21 +711,32 @@ def evaluate_batched(temp_model, best_model, num_games=NUM_GAMES_EVAL, eval_sims
     # Exclude draws: a draw is neither a win nor a loss for either model, so
     # counting it as a loss for the temp model biases the threshold downward.
     temp_wins = 0
+    best_wins = 0
     decided = 0
+    draws = 0
     for g in games:
         if g['winner'] is None:
+            draws += 1
             continue  # draw — exclude from denominator
         decided += 1
         if (g['winner'] == Colour.RED and g['temp_is_red']) or \
            (g['winner'] == Colour.BLUE and not g['temp_is_red']):
             temp_wins += 1
+        else:
+            best_wins += 1
 
     effective_games = decided if decided > 0 else num_games
     win_rate = temp_wins / effective_games
-    logger.info(
-        f"Evaluator: Temp model win rate: {win_rate*100:.1f}% "
-        f"({temp_wins}/{effective_games} decided, {num_games - decided} draw(s))"
+
+    eval_summary = (
+        f"Eval | Temp win rate: {win_rate*100:.1f}% "
+        f"| Temp: {temp_wins}W  Best: {best_wins}W  Draws: {draws} "
+        f"| {decided}/{num_games} decided"
     )
+    # Route to both loggers: main log gets a brief note, eval log gets the full detail
+    logger.info(eval_summary)
+    eval_logger.info(eval_summary)
+
     del games
     del active_games
     gc.collect()
@@ -678,16 +751,17 @@ def _save_and_exit(best_model, trainer, buffer, start_iteration, current_epoch):
     """Save all state and exit gracefully."""
     try:
         # Save the replay buffer
-        buffer.save("agents/cem/buffer.pt")
+        buffer.save()
         logger.info("Replay buffer saved.")
         
         # Save model checkpoint
-        trainer.save_checkpoint(current_epoch + 1, path="agents/cem/")
+        trainer.save_checkpoint(current_epoch + 1)
         torch.save({
             'iteration': current_epoch + 1,
+            'board_size': BOARD_SIZE,
             'model_state_dict': best_model.state_dict(),
             'optimizer_state_dict': trainer.optimizer.state_dict(),
-        }, "agents/cem/best_model.pt")
+        }, os.path.join(CHECKPOINT_DIR, "best_model.pt"))
         logger.info("Model checkpoint saved.")
         
         logger.info(f"Graceful shutdown complete. Reached epoch {current_epoch + 1}.")
@@ -696,48 +770,51 @@ def _save_and_exit(best_model, trainer, buffer, start_iteration, current_epoch):
     
     sys.exit(0)
 
-if __name__ == "__main__":
+def run_training():
+    """Main training loop.  Call configure() beforehand to override defaults."""
+    _setup_logging()
+
     # Register signal handlers for graceful termination
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
-    
+
     # Initialize best model
-    best_model = Hex3HNN(board_size=11).to(device)
-    
+    best_model = Hex3HNN(board_size=BOARD_SIZE).to(device)
+
     trainer = HexTrainer(best_model)
-    iteration = trainer.load_checkpoint("agents/cem/best_model.pt")
-    
+    iteration = trainer.load_checkpoint()
+
     # Initialize ReplayBuffer globally so it persists across epochs
     buffer = ReplayBuffer()
-    buffer.load("agents/cem/buffer.pt")
+    buffer.load()
 
     # Initialize temporary model for training (should be separate instance)
     temp_model = Hex3HNN(board_size=BOARD_SIZE).to(device)
     temp_model.load_state_dict(best_model.state_dict())
     temp_trainer = HexTrainer(temp_model)
-    
+
     for epoch in range(iteration, iteration + EPOCHS):
         logger.info(f"--- Epoch {epoch+1} ---")
-        
+
         # 1. Self Play
         logger.info(f"Starting Self-Play (sims={SELF_PLAY_SIMS})...")
         self_play(best_model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PLAY_SIMS)
-        
+
         # Save buffer periodically
-        buffer.save("agents/cem/buffer.pt")
-        
+        buffer.save()
+
         # 2. Train Temp Model
         logger.info("Starting Training...")
-        
+
         # Train for some iterations on the buffer
         # We need enough 6-element tuples (with target_q) to train
         valid_buffer_size = len(buffer)
         if valid_buffer_size >= BATCH_SIZE:
             total_loss = total_p = total_v = total_q = 0.0
-            
+
             for b in range(TRAINING_STEPS):
                 states, pis, qs, zs, actions, valid_moves = buffer.sample(BATCH_SIZE)
                 loss, p_loss, v_loss, q_loss = temp_trainer.train_step(states, pis, qs, zs, valid_moves)
@@ -745,39 +822,50 @@ if __name__ == "__main__":
                 total_p += p_loss
                 total_v += v_loss
                 total_q += q_loss
-                
+
             logger.info(f"Training Loss: {total_loss/TRAINING_STEPS:.4f} (P: {total_p/TRAINING_STEPS:.4f}, "
                         f"V: {total_v/TRAINING_STEPS:.4f}, Q: {total_q/TRAINING_STEPS:.4f}) | Valid Buffer: {valid_buffer_size}")
-        
+
         # 3. Evaluate (only every EVAL_EVERY epochs)
         if (epoch - iteration) % EVAL_EVERY == 0:
+            eval_header = f"=== Evaluation | Epoch {epoch+1} | sims={EVAL_SIMS} ==="
             logger.info(f"Evaluating (sims={EVAL_SIMS})...")
+            eval_logger.info(eval_header)
             is_better = evaluate_batched(temp_model, best_model, NUM_GAMES_EVAL, eval_sims=EVAL_SIMS)
-            
+
             if is_better:
+                outcome = "ACCEPTED — Temp model promoted to best_model."
                 logger.info("Temp model is better! Saving as new best_model.")
+                eval_logger.info(outcome)
 
                 best_model.load_state_dict(temp_model.state_dict())
 
-                trainer.save_checkpoint(epoch+1, path="agents/cem/")
+                trainer.save_checkpoint(epoch+1)
                 torch.save({
                     'iteration': epoch+1,
+                    'board_size': BOARD_SIZE,
                     'model_state_dict': best_model.state_dict(),
                     'optimizer_state_dict': trainer.optimizer.state_dict(),
-                }, "agents/cem/best_model.pt")
+                }, os.path.join(CHECKPOINT_DIR, "best_model.pt"))
 
             else:
+                outcome = "REJECTED — Temp model reverted to best_model."
                 logger.info("Temp model rejected. Reverting temp_model to best_model.")
+                eval_logger.info(outcome)
                 temp_model.load_state_dict(best_model.state_dict())
 
         print("\n")
-        
+
         # Check for graceful shutdown after each epoch
         if _check_shutdown():
             logger.info("Shutdown requested. Saving state and exiting...")
             _save_and_exit(best_model, trainer, buffer, iteration, epoch)
-    
+
     logger.info("Training completed normally.")
+
+
+if __name__ == "__main__":
+    run_training()
 
 
 
