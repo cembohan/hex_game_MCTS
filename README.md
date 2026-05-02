@@ -39,6 +39,8 @@ help message use `python3 Hex.py --help`.
 python3 Hex.py -p1 "agents.cem.agent1 Agent1" -p2 "agents.DefaultAgents.NaiveAgent NaiveAgent" -v
 python3 Hex.py -p1 "agents.cem.agent1 Agent1" -p2 "agents.MCTSAgent.MCTSAgent MCTSAgent" -v
 python Hex.py -p1 "agents.cem.agent1 Agent1" -p2 "agents.TestAgents.ValidAgent ValidAgent" -v
+python Hex.py -p1 "agents.cem.agent1 Agent1" -p2 "agents.cem.agent1 Agent1" -v
+python Hex_temp.py -p1 "agents.cem.agent1 Agent1" -t1 0.1 -p2 "agents.cem.agent1 Agent1" -t2 0.9 -v
 
 To exit the docker container you can simply do `exit`. This will stop the container.
 

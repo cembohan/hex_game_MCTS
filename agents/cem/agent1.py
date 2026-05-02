@@ -36,10 +36,11 @@ class Hex3HNN(nn.Module):
     2. State-Value (win probability for current player)
     3. Action-Value (Q-values for each possible action)
     """
-    def __init__(self, board_size: int = 11, num_resBlocks: int = 4, num_hidden: int = 64):
+    def __init__(self, board_size: int = 11, temperature: float = 0.1, num_resBlocks: int = 4, num_hidden: int = 64):
         super(Hex3HNN, self).__init__()
         self.board_size = board_size
-        
+        self.temperature = temperature
+
         # Initial Convolution to process input channels
         self.startBlock = nn.Sequential(
             nn.Conv2d(3, num_hidden, kernel_size=3, padding=1),
@@ -96,16 +97,17 @@ class Hex3HNN(nn.Module):
 
 
 class Agent1(AgentBase):
-    def __init__(self, colour: Colour, board_size: int = None):
+    def __init__(self, colour: Colour, board_size: int = None, temperature: float = 0.1):
         super().__init__(colour)
-        
+        self.temperature = temperature
+
         # Check for GPU
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Determine board size
         if board_size is None:
             # Try to infer from checkpoint
-            model_path = os.path.join(os.path.dirname(__file__), "best_model.pt")
+            model_path = os.path.join(os.path.dirname(__file__), "checkpoints/best_model.pt")
             if os.path.isfile(model_path):
                 try:
                     checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
@@ -118,11 +120,11 @@ class Agent1(AgentBase):
         self.board_size = board_size if board_size is not None else 11
         
         # Initialize the 3HNN architecture and move to device
-        self.model = Hex3HNN(board_size=self.board_size).to(self.device)
+        self.model = Hex3HNN(board_size=self.board_size, temperature=self.temperature).to(self.device)
         self.model.eval()  # Default to evaluation mode
         
         # Load best model if exists
-        model_path = os.path.join(os.path.dirname(__file__), "best_model.pt")
+        model_path = os.path.join(os.path.dirname(__file__), "checkpoints/best_model.pt")
         if os.path.isfile(model_path):
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -132,7 +134,7 @@ class Agent1(AgentBase):
         Predicts the best move using MCTS guided by the 3HNN model.
         """
         # We use a relatively small number of simulations for tournament play to stay within time limits
-        mcts = MCTS(self.model, num_simulations=100, temperature=0.1) # low temp for greedy play
+        mcts = MCTS(self.model, num_simulations=100, temperature=self.temperature) # low temp for greedy play
         
         # MCTS handles board encoding internally
         action_probs = mcts.search(board, self.colour, turn)
