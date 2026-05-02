@@ -1,12 +1,12 @@
 .vscode/
 .nv/
 .github/
-agents/cem/buffers/buffer.pt
-agents/cem/buffers_small/buffer.pt
-agents/cem/checkpoints/best_model.pt
-agents/cem/checkpoints_small/best_model.pt
-agents/cem/logs/
-
+agents/cem/buffers/*
+agents/cem/buffers_small/*
+agents/cem/checkpoints/*
+agents/cem/checkpoints_small/*
+agents/cem/logs/*
+agents/cem/archive/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
