@@ -8,6 +8,9 @@ agents/cem/checkpoints_small/*
 agents/cem/logs/*
 agents/cem/archive/*
 
+.bash_history
+.python_history
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
