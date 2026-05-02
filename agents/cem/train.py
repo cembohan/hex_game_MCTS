@@ -34,8 +34,10 @@ from agents.cem.mcts import MCTS, BatchedMCTS, Node, encode_state, get_valid_mov
 import logging
 #TODO - Add notifications on epoch completion (discord, desktop etc.)
 #TODO - (consider) Occasionally start the model from a random node in the MCTS tree instead of the root, to expose it to a wider variety of positions and avoid overfitting to the early game.
-#TODO - (must do) Make evals log to a separate file with detailed results (without the mess of self-play logs)
-
+"""TODO - (ASAP) after the robust implementation of swap rule, keep an eye on the eval cycles,
+if the eval isn't passing (which is now less likely due to newly introduced strategy space),
+delete the buffer.pt and potentially lower the eval win rate threshold.
+"""
 
 # =============================================================================
 # HYPERPARAMETERS
@@ -53,13 +55,13 @@ EPOCHS = 3000                   # Total training epochs
 GAMES_PER_EPOCH = 24            # Self-play games per epoch
 BATCH_SIZE = 256                # Training batch size
 TRAINING_STEPS = 200            # Gradient updates per epoch
-EVAL_EVERY = 10                 # Evaluate every N epochs
+EVAL_EVERY = 20                 # Evaluate every N epochs
 NUM_GAMES_EVAL = 30             # Games for evaluation
 
 # --- MCTS Simulations ---
-SELF_PLAY_SIMS = 30             # MCTS simulations per move during self-play
-EVAL_SIMS = 75                # MCTS simulations per move during evaluation
-OPPONENT_GAME_SIMS = 100        # MCTS simulations per move vs local agents
+SELF_PLAY_SIMS = 50             # MCTS simulations per move during self-play
+EVAL_SIMS = 100                # MCTS simulations per move during evaluation
+OPPONENT_GAME_SIMS = 100       # MCTS simulations per move vs local agents
 
 # --- MCTS Settings ---
 MCTS_TEMPERATURE = 1.0          # Exploration temperature for self-play
@@ -69,7 +71,7 @@ C_PUCT = 2.0                    # UCB exploration constant (unified for MCTS and
 
 # --- Temperature Schedule (for move selection) ---
 TEMP_HIGH_TURNS = 20            # Use high temp for first N turns
-TEMP_MID_TURNS = 30             # Use mid temp for next N turns
+TEMP_MID_TURNS = 0             # Use mid temp for next N turns
 TEMP_HIGH = 1.0                 # High temperature value
 TEMP_MID = 0.7                  # Medium temperature value
 TEMP_LOW = 0.1                  # Low temperature value (greedy)
@@ -406,7 +408,8 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
             # Always sample — even at low temp the distribution is already sharp
             action = int(torch.multinomial(pi_tensor, 1).item())
 
-            state_cpu = encode_state(board, current_colour, device).cpu()
+            state_cpu = encode_state(board, current_colour, device,
+                                     turn=turn if turn == 2 else None).cpu()
             history.append((state_cpu, pi_tensor.numpy(), target_q, current_colour, action, valid_moves))
 
             # Apply the model's move
@@ -475,6 +478,45 @@ def recursive_free(node):
     node.children_values = None
     node.children_q_priors = None
     node.children_exists = None
+
+# Q-score threshold: if RED's turn-1 move scores above this, Blue is forced to swap.
+# A Q of 0.9 means the network believes RED wins ~95% of the time — a dominant opener.
+SWAP_Q_THRESHOLD = 0.90
+
+
+def _decide_swap_turn2(game, swap_idx, mcts_root):
+    """Decide whether Blue should invoke the swap rule on turn 2.
+
+    Strategy
+    --------
+    Right after RED played move A on turn 1, the MCTS root (built for turn 2 /
+    Blue's position) already contains Q-prior estimates for every child.  We look
+    at the Q-value the network assigned to swap_idx (i.e. how good is swapping
+    for Blue?) and compare it to normal-move Q-values to decide.
+
+    Actually simpler: we check the Q-value the network assigned to RED's opener
+    *from RED's perspective* before it became Blue's turn.  That value lives in
+    ``game['red_opener_q']`` which self_play stores right after turn 1.
+
+    If RED's opener was rated > SWAP_Q_THRESHOLD, Blue swaps (stealing that opener).
+    Otherwise Blue plays normally (sample from pi).
+
+    Returns
+    -------
+    int  — the chosen action index (swap_idx or a normal board move)
+    """
+    red_opener_q = game.get('red_opener_q', None)
+
+    if red_opener_q is not None and red_opener_q > SWAP_Q_THRESHOLD:
+        logger.debug(
+            f"[Swap] RED opener Q={red_opener_q:.3f} > {SWAP_Q_THRESHOLD} → forcing SWAP"
+        )
+        return swap_idx
+
+    # RED's opener is not dominant — let Blue decide via its own MCTS policy
+    # (pi has already been computed for this turn; caller will fall through to multinomial)
+    return None  # sentinel: caller uses multinomial
+
 
 def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PLAY_SIMS,
               opponent_game_every=OPPONENT_GAME_EVERY):
@@ -567,13 +609,28 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
                     pi = pi / pi.sum()
 
                 swap_idx = BOARD_SIZE * BOARD_SIZE
-                if turn == 2 and swap_idx in valid_moves and random.random() < 0.3:
-                    action = swap_idx  # force swap ~30% of the time on turn 2
+                # ----------------------------------------------------------------
+                # Smart swap decision (turn 2 only)
+                # ----------------------------------------------------------------
+                # After RED's first move (turn 1) the MCTS root already contains
+                # Q-estimates for every legal move, including RED's chosen action.
+                # We read that Q to judge how dominant the opener is.
+                # Q > 0.9 means the network thinks RED wins ~95%+ of the time —
+                # exactly the kind of strong opener the swap rule is meant to punish.
+                if turn == 2 and swap_idx in valid_moves:
+                    swap_action = _decide_swap_turn2(game, swap_idx, root)
+                    action = swap_action if swap_action is not None else torch.multinomial(pi, 1).item()
                 else:
                     action = torch.multinomial(pi, 1).item()
 
+                # After turn 1 (RED's opener), record the Q-value of the chosen
+                # move so turn-2 Blue can decide whether to invoke the swap rule.
+                if turn == 1:
+                    game['red_opener_q'] = float(target_q[action])
+
                 device = next(model.parameters()).device
-                state_tensor = encode_state(game['board'], game['colour'], device).cpu()
+                state_tensor = encode_state(game['board'], game['colour'], device,
+                                            turn=turn if turn == 2 else None).cpu()
 
                 # NOTE: We now pass target_q to the history instead of calculating it later
                 game['history'].append((state_tensor, pi.numpy(), target_q, game['colour'], action, valid_moves))

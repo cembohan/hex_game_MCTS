@@ -8,3 +8,4 @@ class EndState(Enum):
     TIMEOUT = 1
     BAD_MOVE = 2
     FAILED_LOAD = 3
+    MAX_TURNS = 4

@@ -74,6 +74,13 @@ if __name__ == "__main__":
         default=11,
         help="Specify the board size",
     )
+    parser.add_argument(
+        "-turns",
+        "--max_turns",
+        type=int,
+        default=None,
+        help="Maximum number of turns to play before terminating the game",
+    )
 
 
     parser.add_argument(
@@ -108,6 +115,7 @@ if __name__ == "__main__":
             agent=instantiate_agent(p2_agent_class, Colour.BLUE, args.temp2),
         ),
         board_size=args.board_size,
+        max_turns=args.max_turns,
         logDest=args.log,
         verbose=args.verbose,
     )

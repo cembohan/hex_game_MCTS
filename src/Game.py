@@ -64,6 +64,7 @@ class Game:
         player1: Player,
         player2: Player,
         board_size: int = 11,
+        max_turns: int | None = None,
         logDest: str | TextIO = sys.stderr,
         verbose: bool = False,
         silent: bool = False,
@@ -73,6 +74,7 @@ class Game:
         self.current_player = Colour.RED  # current player
         self._start_time = time()  # used to calculate time elapsed
         self.has_swapped = False  # pie rule
+        self.max_turns = max_turns
         self.player1 = player1
         self.player2 = player2
 
@@ -175,6 +177,10 @@ class Game:
                 break
             if self.board.has_ended(self.current_player):
                 break
+            if self.max_turns is not None and self.turn >= self.max_turns:
+                logger.info(f"Game terminated after reaching maximum turns ({self.max_turns})")
+                endState = EndState.MAX_TURNS
+                break
 
             logger.info(f"Turn Ending Board:\n{str(self.board)}")
 
@@ -248,6 +254,9 @@ class Game:
                     f"Player {self.players[Colour.opposite(self.current_player)].name} has won"
                 )
                 winner = self.players[Colour.opposite(self.current_player)].name
+            case EndState.MAX_TURNS:
+                logger.info(f"Game terminated after reaching maximum turns ({self.max_turns})")
+                winner = None  # No winner when game is terminated by max turns
             case _:
                 logger.error("Game ended abnormally")
                 raise Exception("Game ended abnormally")

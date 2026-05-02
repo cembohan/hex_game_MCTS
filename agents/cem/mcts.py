@@ -102,8 +102,19 @@ def apply_move(board, current_colour, turn, action, inplace=False, check_win=Tru
             
     return new_board, next_colour, turn + 1, is_terminal, winner
 
-def encode_state(board, current_colour, device, out_tensor=None):
-    """Encode board state using cached numpy array for O(1) vectorized encoding."""
+def encode_state(board, current_colour, device, out_tensor=None, turn=None):
+    """Encode board state using cached numpy array for O(1) vectorized encoding.
+
+    Args:
+        board:           The current board.
+        current_colour:  Whose turn it is.
+        device:          Torch device.
+        out_tensor:      Optional pre-allocated output tensor (reused in-place).
+        turn:            Game turn number.  Pass *only* when turn == 2 so the
+                         function knows to inject the swap-legal signal into
+                         channel 2.  Leave as None for every other turn —
+                         the branch is never entered and costs nothing.
+    """
     board_size = board.size
     if out_tensor is None:
         out_tensor = torch.zeros(1, 3, board_size, board_size, device=device)
@@ -122,8 +133,10 @@ def encode_state(board, current_colour, device, out_tensor=None):
         # BLUE's turn: channel 0 = BLUE stones (opponent), channel 1 = RED stones (current)
         out_tensor[0, 0] = torch.from_numpy(color_arr == 2).float()
         out_tensor[0, 1] = torch.from_numpy(color_arr == 1).float()
-        # No channel 2 for BLUE (or could be 0)
-        
+        # Channel 2 swap-legal signal: -1.0 only on turn 2
+        if turn == 2:
+            out_tensor[0, 2] = -1.0  # Neon sign: "SWAP IS LEGAL RIGHT NOW"
+
     return out_tensor
 
 class MCTS:
@@ -141,8 +154,9 @@ class MCTS:
         root = Node(0)
         self.last_root = root  # Expose root for Q-target extraction by callers
         
-        # Initial expansion
-        state_tensor = encode_state(board, current_colour, self.device, out_tensor=self.state_buffer)
+        # Initial expansion — pass turn so the swap-legal signal fires on turn 2
+        state_tensor = encode_state(board, current_colour, self.device, out_tensor=self.state_buffer,
+                                    turn=turn if turn == 2 else None)
         policy_logits, _, q_preds = self.model(state_tensor)
         policy_probs = F.softmax(policy_logits[0], dim=0).cpu().numpy()
         q_values = q_preds[0].cpu().numpy()
@@ -207,7 +221,8 @@ class MCTS:
             if is_terminal:
                 value = -1.0 
             else:
-                state_tensor = encode_state(sim_board, sim_colour, self.device, out_tensor=self.state_buffer)
+                state_tensor = encode_state(sim_board, sim_colour, self.device, out_tensor=self.state_buffer,
+                                            turn=sim_turn if sim_turn == 2 else None)
                 policy_logits, value_pred, q_preds = self.model(state_tensor)
                 value = value_pred.item()
                 policy_probs = F.softmax(policy_logits[0], dim=0).cpu().numpy()
@@ -292,7 +307,8 @@ class BatchedMCTS:
             state_tensor = torch.zeros(len(unexpanded_roots), 3, self.board_size, self.board_size, device=self.device)
             for idx_idx, idx in enumerate(unexpanded_roots):
                 game = active_games[idx]
-                encode_state(game['board'], game['colour'], self.device, out_tensor=state_tensor[idx_idx:idx_idx+1])
+                _t = game['turn'] if game['turn'] == 2 else None
+                encode_state(game['board'], game['colour'], self.device, out_tensor=state_tensor[idx_idx:idx_idx+1], turn=_t)
                 
             policy_logits, _, q_preds = self.model(state_tensor)
             policy_probs = F.softmax(policy_logits, dim=1).cpu().numpy()
@@ -386,7 +402,8 @@ class BatchedMCTS:
             if unexpanded_indices:
                 state_tensor = torch.zeros(len(unexpanded_indices), 3, self.board_size, self.board_size, device=self.device)
                 for idx_idx, idx in enumerate(unexpanded_indices):
-                    encode_state(sim_boards[idx], sim_colours[idx], self.device, out_tensor=state_tensor[idx_idx:idx_idx+1])
+                    _t = sim_turns[idx] if sim_turns[idx] == 2 else None
+                    encode_state(sim_boards[idx], sim_colours[idx], self.device, out_tensor=state_tensor[idx_idx:idx_idx+1], turn=_t)
                     
                 policy_logits, value_preds, q_preds = self.model(state_tensor)
                 policy_probs = F.softmax(policy_logits, dim=1).cpu().numpy()

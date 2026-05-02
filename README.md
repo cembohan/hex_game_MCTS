@@ -41,6 +41,7 @@ python3 Hex.py -p1 "agents.cem.agent1 Agent1" -p2 "agents.MCTSAgent.MCTSAgent MC
 python Hex.py -p1 "agents.cem.agent1 Agent1" -p2 "agents.TestAgents.ValidAgent ValidAgent" -v
 python Hex.py -p1 "agents.cem.agent1 Agent1" -p2 "agents.cem.agent1 Agent1" -v
 python Hex_temp.py -p1 "agents.cem.agent1 Agent1" -t1 0.1 -p2 "agents.cem.agent1 Agent1" -t2 0.9 -v
+python Hex_temp.py -p1 "agents.cem.agent1 Agent1" -t1 0.1 -p2 "agents.cem.agent1 Agent1" -t2 0.5 -v -turns 2 -l
 
 To exit the docker container you can simply do `exit`. This will stop the container.
 
