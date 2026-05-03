@@ -12,6 +12,8 @@ from src.Move import Move
 # Global board configuration
 BOARD_SIZE = 11
 NUM_ACTIONS = 122  # board_size * board_size + 1
+ALPHA = 0.15
+EPSILON = 0.40
 
 def init_board_config(board_size):
     """Initialize MCTS with the target board size. Call this before creating MCTS instances."""
@@ -140,11 +142,12 @@ def encode_state(board, current_colour, device, out_tensor=None, turn=None):
     return out_tensor
 
 class MCTS:
-    def __init__(self, model, num_simulations=400, c_puct=2.0, temperature=1.0):
+    def __init__(self, model, num_simulations=400, c_puct=2.0, temperature=1.0, full_expansion=False):
         self.model = model
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.temperature = temperature
+        self.full_expansion = full_expansion
         self.device = next(self.model.parameters()).device
         # Pre-allocate buffer to avoid reallocation bottleneck
         self.state_buffer = torch.zeros(1, 3, self.model.board_size, self.model.board_size, device=self.device)
@@ -162,21 +165,47 @@ class MCTS:
         q_values = q_preds[0].cpu().numpy()
         
         valid_moves = get_valid_moves(board, turn)
-        
+                
         if len(valid_moves) > 0:
-            k = min(20, len(valid_moves))  # top-20: reduces risk of permanently pruning optimal moves
-            top_k = np.argsort(policy_probs[valid_moves])[-k:]
-            top_k_moves = [valid_moves[idx] for idx in top_k]
             
-            policy_sum = sum(policy_probs[a] for a in top_k_moves)
+            # 1. Mix noise into ALL valid moves FIRST
+            noised_probs = np.copy(policy_probs)
+            noise = np.random.dirichlet([ALPHA] * len(valid_moves))
             
-            # Add Dirichlet Noise to root node
-            epsilon = 0.25
-            alpha = 0.3
-            noise = np.random.dirichlet([alpha] * len(top_k_moves))
+            for i, a in enumerate(valid_moves):
+                noised_probs[a] = (1 - EPSILON) * policy_probs[a] + EPSILON * noise[i]
+                
+            # 2. Select which moves to expand at the root.
+            # full_expansion=True (exploratory games): expand all valid moves.
+            # Otherwise: top 16 by noised prob + 4 random tail moves.
+            if self.full_expansion:
+                top_k_moves = valid_moves
+            else:
+                k_main = min(16, len(valid_moves))
+                k_tail = 4
+
+                # top moves
+                top_indices = np.argsort(noised_probs[valid_moves])[-k_main:]
+                top_moves = [valid_moves[i] for i in top_indices]
+
+                # tail sampling
+                remaining = list(set(valid_moves) - set(top_moves))
+                if remaining:
+                    tail_moves = np.random.choice(
+                        remaining,
+                        size=min(k_tail, len(remaining)),
+                        replace=False
+                    )
+                else:
+                    tail_moves = []
+
+                top_k_moves = top_moves + list(tail_moves)
             
-            for idx, a in enumerate(top_k_moves):
-                p = (1 - epsilon) * (policy_probs[a] / policy_sum) + epsilon * noise[idx] if policy_sum > 0 else 1.0 / len(top_k_moves)
+            # 3. Normalize only the selected top 20 so they sum to 1.0
+            policy_sum = sum(noised_probs[a] for a in top_k_moves)
+            
+            for a in top_k_moves:
+                p = noised_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
                 child_node = Node(p, parent=root, action_from_parent=a)
                 child_node.q_prior = q_values[a]
                 
@@ -232,9 +261,24 @@ class MCTS:
                 if len(valid_moves) == 0:
                     value = 0 
                 else:
-                    k = min(20, len(valid_moves))  # top-20 to match root expansion
-                    top_k = np.argsort(policy_probs[valid_moves])[-k:]
-                    top_k_moves = [valid_moves[idx] for idx in top_k]
+                    # Inner-node expansion: full_expansion → all moves; else top 18 + 2 tail.
+                    if self.full_expansion:
+                        top_k_moves = valid_moves
+                    else:
+                        k_main = min(18, len(valid_moves))
+                        k_tail = 2
+                        top_indices = np.argsort(policy_probs[valid_moves])[-k_main:]
+                        top_moves = [valid_moves[i] for i in top_indices]
+                        remaining = list(set(valid_moves) - set(top_moves))
+                        if remaining:
+                            tail_moves = np.random.choice(
+                                remaining,
+                                size=min(k_tail, len(remaining)),
+                                replace=False
+                            )
+                        else:
+                            tail_moves = []
+                        top_k_moves = top_moves + list(tail_moves)
                     
                     policy_sum = sum(policy_probs[a] for a in top_k_moves)
                     for a in top_k_moves:
@@ -283,12 +327,13 @@ class MCTS:
 
 
 class BatchedMCTS:
-    def __init__(self, model, num_simulations=100, temperature=1.0, c_puct=2.0, add_noise=True):
+    def __init__(self, model, num_simulations=100, temperature=1.0, c_puct=2.0, add_noise=True, full_expansion=False):
         self.model = model
         self.num_simulations = num_simulations
         self.temperature = temperature
         self.c_puct = c_puct
         self.add_noise = add_noise
+        self.full_expansion = full_expansion
         self.device = next(self.model.parameters()).device
         self.board_size = self.model.board_size
         
@@ -313,10 +358,7 @@ class BatchedMCTS:
             policy_logits, _, q_preds = self.model(state_tensor)
             policy_probs = F.softmax(policy_logits, dim=1).cpu().numpy()
             q_values = q_preds.cpu().numpy()
-            
-            epsilon = 0.25
-            alpha = 0.3
-            
+                        
             for idx_idx, idx in enumerate(unexpanded_roots):
                 game = active_games[idx]
                 root = game['root']
@@ -325,20 +367,45 @@ class BatchedMCTS:
                 if valid_moves:
                     p_probs = policy_probs[idx_idx]
                     q_vals = q_values[idx_idx]
-                    
-                    k = min(20, len(valid_moves))  # top-20 to match root expansion
-                    top_k = np.argsort(p_probs[valid_moves])[-k:]
-                    top_k_moves = [valid_moves[idx] for idx in top_k]
-                    
-                    policy_sum = sum(p_probs[a] for a in top_k_moves)
+                                        
+                    # 1. Mix noise into ALL valid moves FIRST
+                    noised_probs = np.copy(p_probs)
                     if self.add_noise:
-                        noise = np.random.dirichlet([alpha] * len(top_k_moves))
+                        noise = np.random.dirichlet([ALPHA] * len(valid_moves))
+                        for i, a in enumerate(valid_moves):
+                            noised_probs[a] = (1 - EPSILON) * p_probs[a] + EPSILON * noise[i]
                     
-                    for noise_idx, a in enumerate(top_k_moves):
-                        if self.add_noise:
-                            p = (1 - epsilon) * (p_probs[a] / policy_sum) + epsilon * noise[noise_idx] if policy_sum > 0 else 1.0 / len(top_k_moves)
+                    # 2. Select which moves to expand at the root.
+                    # full_expansion=True (exploratory games): expand all valid moves.
+                    # Otherwise: top 16 by noised prob + 4 random tail moves.
+                    if self.full_expansion:
+                        top_k_moves = valid_moves
+                    else:
+                        k_main = min(16, len(valid_moves))
+                        k_tail = 4
+
+                        # top moves
+                        top_indices = np.argsort(noised_probs[valid_moves])[-k_main:]
+                        top_moves = [valid_moves[i] for i in top_indices]
+
+                        # tail sampling
+                        remaining = list(set(valid_moves) - set(top_moves))
+                        if remaining:
+                            tail_moves = np.random.choice(
+                                remaining,
+                                size=min(k_tail, len(remaining)),
+                                replace=False
+                            )
                         else:
-                            p = p_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
+                            tail_moves = []
+
+                        top_k_moves = top_moves + list(tail_moves)
+                    
+                    # 3. Normalize the selected top 20
+                    policy_sum = sum(noised_probs[a] for a in top_k_moves)
+                    
+                    for a in top_k_moves:
+                        p = noised_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
                         child = Node(p, parent=root, action_from_parent=a)
                         child.q_prior = q_vals[a]
                         
@@ -427,9 +494,24 @@ class BatchedMCTS:
                     if not valid_moves:
                         value = 0.0
                     else:
-                        k = min(20, len(valid_moves))  # top-20 to match root expansion
-                        top_k = np.argsort(p_probs[valid_moves])[-k:]
-                        top_k_moves = [valid_moves[idx] for idx in top_k]
+                        # Inner-node expansion: full_expansion → all moves; else top 18 + 2 tail.
+                        if self.full_expansion:
+                            top_k_moves = valid_moves
+                        else:
+                            k_main = min(18, len(valid_moves))
+                            k_tail = 2
+                            top_indices = np.argsort(p_probs[valid_moves])[-k_main:]
+                            top_moves = [valid_moves[i] for i in top_indices]
+                            remaining = list(set(valid_moves) - set(top_moves))
+                            if remaining:
+                                tail_moves = np.random.choice(
+                                    remaining,
+                                    size=min(k_tail, len(remaining)),
+                                    replace=False
+                                )
+                            else:
+                                tail_moves = []
+                            top_k_moves = top_moves + list(tail_moves)
                         
                         policy_sum = sum(p_probs[a] for a in top_k_moves)
                         for a in top_k_moves:

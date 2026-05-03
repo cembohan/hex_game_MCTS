@@ -3,6 +3,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# ── Debug toggle ────────────────────────────────────────────────────────────
+# Set to True to print log-probabilities of all 122 actions on turn 2.
+DEBUG_LOG_PROBS: bool = True
+# ────────────────────────────────────────────────────────────────────────────
+
 from src.AgentBase import AgentBase
 from src.Board import Board
 from src.Colour import Colour
@@ -126,6 +131,7 @@ class Agent1(AgentBase):
         # Load best model if exists
         model_path = os.path.join(os.path.dirname(__file__), "checkpoints/best_model.pt")
         if os.path.isfile(model_path):
+            print(f"Loading model from {model_path}...")
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             self.model.load_state_dict(checkpoint['model_state_dict'])
     
@@ -138,9 +144,33 @@ class Agent1(AgentBase):
         
         # MCTS handles board encoding internally
         action_probs = mcts.search(board, self.colour, turn)
-        
+
+        # ── log-prob debug table ──────────────────────────────────────
+        if DEBUG_LOG_PROBS: 
+            log_probs = torch.log(action_probs.clamp(min=1e-9))  # (122,)
+            board_log_probs = log_probs[:self.board_size * self.board_size]  # (121,)
+            swap_log_prob   = log_probs[self.board_size * self.board_size].item()
+
+            grid = board_log_probs.reshape(self.board_size, self.board_size)  # (11, 11)
+
+            col_width = 8
+            header = "  " + "".join(f"{c:>{col_width}}" for c in range(self.board_size))
+            print(f"\n[DEBUG] Log-probs of all {self.board_size * self.board_size + 1} actions at turn {turn}:")
+            print(header)
+            print("  " + "-" * (col_width * self.board_size))
+            for r in range(self.board_size):
+                row_vals = "".join(f"{grid[r, c].item():>{col_width}.3f}" for c in range(self.board_size))
+                print(f"{r:>2}|{row_vals}")
+            print(f"\n  {'swap':>{col_width - 2}}: {swap_log_prob:.3f}")
+            print()
+
+        # ─────────────────────────────────────────────────────────────────────
+
         # Select best action
-        best_action = torch.argmax(action_probs).item()
+        if self.temperature > 0:
+            best_action = torch.multinomial(action_probs, 1).item()
+        else:
+            best_action = torch.argmax(action_probs).item()
         
         if best_action == self.board_size * self.board_size:
             return Move(-1, -1) # Swap move

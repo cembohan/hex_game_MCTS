@@ -32,7 +32,7 @@ from agents.cem.agent1 import Hex3HNN
 from agents.cem.mcts import MCTS, BatchedMCTS, Node, encode_state, get_valid_moves, apply_move, init_board_config
 
 import logging
-#TODO - Add notifications on epoch completion (discord, desktop etc.)
+#TODO - Add notifications on eval completion (discord, desktop etc.)
 #TODO - (consider) Occasionally start the model from a random node in the MCTS tree instead of the root, to expose it to a wider variety of positions and avoid overfitting to the early game.
 """TODO - (ASAP) after the robust implementation of swap rule, keep an eye on the eval cycles,
 if the eval isn't passing (which is now less likely due to newly introduced strategy space),
@@ -55,11 +55,12 @@ EPOCHS = 3000                   # Total training epochs
 GAMES_PER_EPOCH = 24            # Self-play games per epoch
 BATCH_SIZE = 256                # Training batch size
 TRAINING_STEPS = 200            # Gradient updates per epoch
-EVAL_EVERY = 20                 # Evaluate every N epochs
+EVAL_EVERY = 10                 # Evaluate every N epochs
 NUM_GAMES_EVAL = 30             # Games for evaluation
+EXPLORATORY_EVERY = 10          # Self-play games per epoch
 
 # --- MCTS Simulations ---
-SELF_PLAY_SIMS = 50             # MCTS simulations per move during self-play
+SELF_PLAY_SIMS = 30            # MCTS simulations per move during self-play
 EVAL_SIMS = 100                # MCTS simulations per move during evaluation
 OPPONENT_GAME_SIMS = 100       # MCTS simulations per move vs local agents
 
@@ -67,10 +68,10 @@ OPPONENT_GAME_SIMS = 100       # MCTS simulations per move vs local agents
 MCTS_TEMPERATURE = 1.0          # Exploration temperature for self-play
 MCTS_TEMPERATURE_EVAL = 0.3     # Exploration temperature for evaluation
 ADD_NOISE = True                # Add Dirichlet noise to root (self-play only)
-C_PUCT = 2.0                    # UCB exploration constant (unified for MCTS and BatchedMCTS)
+C_PUCT = 1.25                   # UCB exploration constant (unified for MCTS and BatchedMCTS)
 
 # --- Temperature Schedule (for move selection) ---
-TEMP_HIGH_TURNS = 20            # Use high temp for first N turns
+TEMP_HIGH_TURNS = 12            # Use high temp for first N turns
 TEMP_MID_TURNS = 0             # Use mid temp for next N turns
 TEMP_HIGH = 1.0                 # High temperature value
 TEMP_MID = 0.7                  # Medium temperature value
@@ -80,7 +81,7 @@ TEMP_LOW = 0.1                  # Low temperature value (greedy)
 OPPONENT_GAME_EVERY = 0         # Play vs local agent every N games (0 to disable)
 
 # --- Evaluation ---
-EVAL_WIN_RATE_THRESHOLD = 0.55  # Win rate needed to replace best model (55%)
+EVAL_WIN_RATE_THRESHOLD = 0.51  # Win rate needed to replace best model (55%)
 
 # --- Board Size (fixed for now) ---
 BOARD_SIZE = 11
@@ -389,12 +390,11 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
     while True:
         if current_colour == model_colour:
             # ---- Model's turn: use MCTS ----
-            # mcts.search builds the tree and returns visit-count probs; it also
-            # stores the root internally so we can extract MCTS Q-targets from it.
-            pi_tensor = mcts.search(board, current_colour, turn)
+            # MCTS always runs at temperature=1.0 to get the raw visit distribution for the replay buffer.
+            raw_pi_tensor = mcts.search(board, current_colour, turn)
             device = next(model.parameters()).device
 
-            # Extract Q-targets from MCTS root (consistent with self_play definition)
+            # Extract Q-targets from MCTS root
             root = mcts.last_root
             target_q = np.zeros(BOARD_SIZE * BOARD_SIZE + 1, dtype=np.float32)
             visits = root.children_visits
@@ -405,12 +405,26 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
 
             valid_moves = get_valid_moves(board, turn)
 
-            # Always sample — even at low temp the distribution is already sharp
-            action = int(torch.multinomial(pi_tensor, 1).item())
+            # --- Temperature schedule for Action Selection ---
+            temp = (TEMP_HIGH if turn < TEMP_HIGH_TURNS
+                    else TEMP_MID if turn < TEMP_MID_TURNS
+                    else TEMP_LOW)
+            
+            if temp != 1.0:
+                sample_pi = raw_pi_tensor ** (1.0 / temp)
+                sample_pi = sample_pi / sample_pi.sum()
+            else:
+                sample_pi = raw_pi_tensor
 
+            action = int(torch.multinomial(sample_pi, 1).item())
+
+            # Encode state for the neural network. (Note: The NN only needs to know 
+            # if it's turn 2 for the swap rule, otherwise we pass turn=None).
             state_cpu = encode_state(board, current_colour, device,
                                      turn=turn if turn == 2 else None).cpu()
-            history.append((state_cpu, pi_tensor.numpy(), target_q, current_colour, action, valid_moves))
+            
+            # CRITICAL: We must store the RAW unsharpened pi in the history as the target!
+            history.append((state_cpu, raw_pi_tensor.numpy(), target_q, current_colour, action, valid_moves))
 
             # Apply the model's move
             move_obj = Move(-1, -1) if action == BOARD_SIZE * BOARD_SIZE else Move(*divmod(action, BOARD_SIZE))
@@ -519,7 +533,7 @@ def _decide_swap_turn2(game, swap_idx, mcts_root):
 
 
 def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PLAY_SIMS,
-              opponent_game_every=OPPONENT_GAME_EVERY):
+              opponent_game_every=OPPONENT_GAME_EVERY, iteration=0):
     """
     Run a batch of self-play games, with diversity injection:
     - Every `opponent_game_every` games (0-indexed), play against a randomly
@@ -557,17 +571,41 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
 
     # --- 3. Batched self-play games ---
     if num_self_play_games > 0:
+        # Every 10th self-play game (0-indexed within self-play slots) uses
+        # full_expansion=True: the MCTS expands ALL valid moves at every node
+        # instead of capping at top-16+4.  This acts as an "exploration reset"
+        # that prevents the buffer from becoming an echo chamber.
         active_games = []
-        for _ in range(num_self_play_games):
+        for sp_idx in range(num_self_play_games):
+            if iteration < 200:
+                is_exploratory = True
+            else:
+                is_exploratory = (sp_idx % EXPLORATORY_EVERY == 0)
             active_games.append({
                 'board': Board(BOARD_SIZE),
                 'colour': Colour.RED,
                 'turn': 1,
                 'history': [],
-                'root': Node(0)
+                'root': Node(0),
+                'full_expansion': is_exploratory,
             })
 
-        mcts = BatchedMCTS(model, num_simulations=mcts_simulations, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE)
+        num_exploratory = sum(1 for g in active_games if g['full_expansion'])
+        logger.info(
+            f"Self-play batch: {num_self_play_games} games "
+            f"({num_exploratory} exploratory / {num_self_play_games - num_exploratory} normal)"
+        )
+
+        # Two MCTS instances — one per expansion mode.  Both are stateless
+        # (no tree reuse across games) so sharing is safe.
+        mcts_normal = BatchedMCTS(
+            model, num_simulations=mcts_simulations, c_puct=C_PUCT,
+            temperature=MCTS_TEMPERATURE, full_expansion=False
+        )
+        mcts_exploratory = BatchedMCTS(
+            model, num_simulations=mcts_simulations, c_puct=C_PUCT,
+            temperature=MCTS_TEMPERATURE, full_expansion=True
+        )
 
         while active_games:
             # Check for shutdown before each batch
@@ -578,12 +616,27 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
                 for game in active_games:
                     recursive_free(game['root'])
                 break
-                
-            batch_pis = mcts.search(active_games)
+
+            # Split by expansion mode and search each sub-batch separately
+            normal_games      = [g for g in active_games if not g['full_expansion']]
+            exploratory_games = [g for g in active_games if     g['full_expansion']]
+
+            # Maps game-object → its pi tensor so we can reunify below
+            pi_map = {}
+            if normal_games:
+                pis = mcts_normal.search(normal_games)
+                for g, pi in zip(normal_games, pis):
+                    pi_map[id(g)] = pi
+            if exploratory_games:
+                pis = mcts_exploratory.search(exploratory_games)
+                for g, pi in zip(exploratory_games, pis):
+                    pi_map[id(g)] = pi
+
+            batch_pis = [pi_map[id(g)] for g in active_games]
 
             next_active = []
             for idx, game in enumerate(active_games):
-                pi = batch_pis[idx]
+                raw_pi = batch_pis[idx]
                 root = game['root']
 
                 # Extract true MCTS Q-values
@@ -598,30 +651,28 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
 
                 # --- Temperature schedule ---
                 # BatchedMCTS returns raw visit proportions (temperature=1.0 inside MCTS).
-                # We apply the per-turn sharpening here so both the stored training label
-                # (pi stored in history) and the action sample come from the same distribution.
+                # We apply the per-turn sharpening here for action selection, but we MUST 
+                # keep the raw_pi for the replay buffer to preserve MCTS exploration value.
                 turn = game['turn']
                 temp = (TEMP_HIGH if turn < TEMP_HIGH_TURNS
                         else TEMP_MID if turn < TEMP_MID_TURNS
                         else TEMP_LOW)
+                
                 if temp != 1.0:
-                    pi = pi ** (1.0 / temp)
-                    pi = pi / pi.sum()
+                    sample_pi = raw_pi ** (1.0 / temp)
+                    sample_pi = sample_pi / sample_pi.sum()
+                else:
+                    sample_pi = raw_pi
 
                 swap_idx = BOARD_SIZE * BOARD_SIZE
                 # ----------------------------------------------------------------
                 # Smart swap decision (turn 2 only)
                 # ----------------------------------------------------------------
-                # After RED's first move (turn 1) the MCTS root already contains
-                # Q-estimates for every legal move, including RED's chosen action.
-                # We read that Q to judge how dominant the opener is.
-                # Q > 0.9 means the network thinks RED wins ~95%+ of the time —
-                # exactly the kind of strong opener the swap rule is meant to punish.
                 if turn == 2 and swap_idx in valid_moves:
                     swap_action = _decide_swap_turn2(game, swap_idx, root)
-                    action = swap_action if swap_action is not None else torch.multinomial(pi, 1).item()
+                    action = swap_action if swap_action is not None else torch.multinomial(sample_pi, 1).item()
                 else:
-                    action = torch.multinomial(pi, 1).item()
+                    action = torch.multinomial(sample_pi, 1).item()
 
                 # After turn 1 (RED's opener), record the Q-value of the chosen
                 # move so turn-2 Blue can decide whether to invoke the swap rule.
@@ -629,11 +680,13 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
                     game['red_opener_q'] = float(target_q[action])
 
                 device = next(model.parameters()).device
+                
+                # Note: Neural Network only needs to know turn 2 for the swap-rule signal
                 state_tensor = encode_state(game['board'], game['colour'], device,
                                             turn=turn if turn == 2 else None).cpu()
 
-                # NOTE: We now pass target_q to the history instead of calculating it later
-                game['history'].append((state_tensor, pi.numpy(), target_q, game['colour'], action, valid_moves))
+                # CRITICAL: We append the RAW unsharpened MCTS probabilities to the history!
+                game['history'].append((state_tensor, raw_pi.numpy(), target_q, game['colour'], action, valid_moves))
 
                 new_board, next_col, next_turn, is_terminal, winner = apply_move(
                     game['board'], game['colour'], game['turn'], action
@@ -858,7 +911,7 @@ def run_training():
 
         # 1. Self Play
         logger.info(f"Starting Self-Play (sims={SELF_PLAY_SIMS})...")
-        self_play(best_model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PLAY_SIMS)
+        self_play(best_model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PLAY_SIMS, iteration=epoch)
 
         # Save buffer periodically
         buffer.save()
