@@ -69,6 +69,7 @@ MCTS_TEMPERATURE = 1.0          # Exploration temperature for self-play
 MCTS_TEMPERATURE_EVAL = 0.3     # Exploration temperature for evaluation
 ADD_NOISE = True                # Add Dirichlet noise to root (self-play only)
 C_PUCT = 2.0                   # UCB exploration constant (unified for MCTS and BatchedMCTS)
+MAX_EXPANSION_WIDTH = False     # Toggle for top-k node expansion. Set to an int (e.g., 16) for top-k, or False/None for full regular MCTS expansion
 
 # --- Temperature Schedule (for move selection) ---
 TEMP_HIGH_TURNS = 20            # Use high temp for first N turns
@@ -369,7 +370,7 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
     opp_agent = load_random_local_agent(opp_colour)
     logger.debug(f"Opponent-diversity game: model={model_colour}, opp={type(opp_agent).__name__}")
 
-    mcts = MCTS(model, num_simulations=mcts_simulations, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE)
+    mcts = MCTS(model, num_simulations=mcts_simulations, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE, max_expansion_width=MAX_EXPANSION_WIDTH)
 
     history      = []          # (state_tensor, pi, colour, action, valid_moves)
     current_colour = Colour.RED
@@ -560,10 +561,10 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
                 'turn': 1,
                 'history': [],
                 'root': Node(0),
-                'full_expansion': is_exploratory,
+                'is_exploratory': is_exploratory,
             })
 
-        num_exploratory = sum(1 for g in active_games if g['full_expansion'])
+        num_exploratory = sum(1 for g in active_games if g['is_exploratory'])
         logger.info(
             f"Self-play batch: {num_self_play_games} games "
             f"({num_exploratory} exploratory / {num_self_play_games - num_exploratory} normal)"
@@ -573,11 +574,11 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
         # (no tree reuse across games) so sharing is safe.
         mcts_normal = BatchedMCTS(
             model, num_simulations=mcts_simulations, c_puct=C_PUCT,
-            temperature=MCTS_TEMPERATURE, full_expansion=False
+            temperature=MCTS_TEMPERATURE, max_expansion_width=MAX_EXPANSION_WIDTH
         )
         mcts_exploratory = BatchedMCTS(
             model, num_simulations=mcts_simulations, c_puct=C_PUCT,
-            temperature=MCTS_TEMPERATURE, full_expansion=True
+            temperature=MCTS_TEMPERATURE, max_expansion_width=None
         )
 
         while active_games:
@@ -591,8 +592,8 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
                 break
 
             # Split by expansion mode and search each sub-batch separately
-            normal_games      = [g for g in active_games if not g['full_expansion']]
-            exploratory_games = [g for g in active_games if     g['full_expansion']]
+            normal_games      = [g for g in active_games if not g['is_exploratory']]
+            exploratory_games = [g for g in active_games if     g['is_exploratory']]
 
             # Maps game-object → its pi tensor so we can reunify below
             pi_map = {}
@@ -738,13 +739,13 @@ def evaluate_batched(temp_model, best_model, num_games=NUM_GAMES_EVAL, eval_sims
         # 2. BATCHED SEARCH (No Noise, Low Temperature)
         # We reuse your BatchedMCTS class
         if temp_batch:
-            mcts_temp = BatchedMCTS(temp_model, num_simulations=eval_sims, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE_EVAL, add_noise=False)
+            mcts_temp = BatchedMCTS(temp_model, num_simulations=eval_sims, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE_EVAL, add_noise=False, max_expansion_width=MAX_EXPANSION_WIDTH)
             batch_pis_temp = mcts_temp.search(temp_batch)
             for idx, g in enumerate(temp_batch):
                 g['pi'] = batch_pis_temp[idx]
 
         if best_batch:
-            mcts_best = BatchedMCTS(best_model, num_simulations=eval_sims, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE_EVAL, add_noise=False)
+            mcts_best = BatchedMCTS(best_model, num_simulations=eval_sims, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE_EVAL, add_noise=False, max_expansion_width=MAX_EXPANSION_WIDTH)
             batch_pis_best = mcts_best.search(best_batch)
             for idx, g in enumerate(best_batch):
                 g['pi'] = batch_pis_best[idx]

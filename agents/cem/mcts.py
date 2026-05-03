@@ -140,12 +140,12 @@ def encode_state(board, current_colour, device, out_tensor=None, turn=None):
     return out_tensor
 
 class MCTS:
-    def __init__(self, model, num_simulations=400, c_puct=2.0, temperature=1.0, full_expansion=False):
+    def __init__(self, model, num_simulations=400, c_puct=2.0, temperature=1.0, max_expansion_width=None):
         self.model = model
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.temperature = temperature
-        self.full_expansion = full_expansion
+        self.max_expansion_width = max_expansion_width
         self.device = next(self.model.parameters()).device
         # Pre-allocate buffer to avoid reallocation bottleneck
         self.state_buffer = torch.zeros(1, 3, self.model.board_size, self.model.board_size, device=self.device)
@@ -173,12 +173,12 @@ class MCTS:
                 noised_probs[a] = (1 - EPSILON) * policy_probs[a] + EPSILON * noise[i]
                 
             # 2. Select which moves to expand at the root.
-            # full_expansion=True (exploratory games): expand all valid moves.
-            # Otherwise: top 16 by noised prob + 4 random tail moves.
-            if self.full_expansion:
+            # max_expansion_width=None or False means full expansion.
+            # Otherwise: top max_expansion_width by noised prob + 4 random tail moves.
+            if not self.max_expansion_width:
                 top_k_moves = valid_moves
             else:
-                k_main = min(16, len(valid_moves))
+                k_main = min(self.max_expansion_width, len(valid_moves))
                 k_tail = 4
 
                 # top moves
@@ -257,11 +257,11 @@ class MCTS:
                 if len(valid_moves) == 0:
                     value = 0 
                 else:
-                    # Inner-node expansion: full_expansion → all moves; else top 18 + 2 tail.
-                    if self.full_expansion:
+                    # Inner-node expansion: max_expansion_width=None/False -> all moves; else top max_expansion_width+2 + 2 tail.
+                    if not self.max_expansion_width:
                         top_k_moves = valid_moves
                     else:
-                        k_main = min(18, len(valid_moves))
+                        k_main = min(self.max_expansion_width + 2, len(valid_moves))
                         k_tail = 2
                         top_indices = np.argsort(policy_probs[valid_moves])[-k_main:]
                         top_moves = [valid_moves[i] for i in top_indices]
@@ -321,13 +321,13 @@ class MCTS:
 
 
 class BatchedMCTS:
-    def __init__(self, model, num_simulations=100, temperature=1.0, c_puct=2.0, add_noise=True, full_expansion=False):
+    def __init__(self, model, num_simulations=100, temperature=1.0, c_puct=2.0, add_noise=True, max_expansion_width=None):
         self.model = model
         self.num_simulations = num_simulations
         self.temperature = temperature
         self.c_puct = c_puct
         self.add_noise = add_noise
-        self.full_expansion = full_expansion
+        self.max_expansion_width = max_expansion_width
         self.device = next(self.model.parameters()).device
         self.board_size = self.model.board_size
         
@@ -368,12 +368,12 @@ class BatchedMCTS:
                             noised_probs[a] = (1 - EPSILON) * p_probs[a] + EPSILON * noise[i]
                     
                     # 2. Select which moves to expand at the root.
-                    # full_expansion=True (exploratory games): expand all valid moves.
-                    # Otherwise: top 16 by noised prob + 4 random tail moves.
-                    if self.full_expansion:
+                    # max_expansion_width=None or False means full expansion.
+                    # Otherwise: top max_expansion_width by noised prob + 4 random tail moves.
+                    if not self.max_expansion_width:
                         top_k_moves = valid_moves
                     else:
-                        k_main = min(16, len(valid_moves))
+                        k_main = min(self.max_expansion_width, len(valid_moves))
                         k_tail = 4
 
                         # top moves
@@ -484,11 +484,11 @@ class BatchedMCTS:
                     if not valid_moves:
                         value = 0.0
                     else:
-                        # Inner-node expansion: full_expansion → all moves; else top 18 + 2 tail.
-                        if self.full_expansion:
+                        # Inner-node expansion: max_expansion_width=None/False -> all moves; else top max_expansion_width+2 + 2 tail.
+                        if not self.max_expansion_width:
                             top_k_moves = valid_moves
                         else:
-                            k_main = min(18, len(valid_moves))
+                            k_main = min(self.max_expansion_width + 2, len(valid_moves))
                             k_tail = 2
                             top_indices = np.argsort(p_probs[valid_moves])[-k_main:]
                             top_moves = [valid_moves[i] for i in top_indices]
