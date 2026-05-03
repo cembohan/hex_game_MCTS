@@ -28,7 +28,7 @@ from src.Board import Board
 from src.Colour import Colour
 from src.Move import Move
 
-from agents.cem.agent1 import Hex3HNN
+from agents.cem.agent1 import HexPVNet
 from agents.cem.mcts import MCTS, BatchedMCTS, Node, encode_state, get_valid_moves, apply_move, init_board_config
 
 import logging
@@ -47,7 +47,7 @@ delete the buffer.pt and potentially lower the eval win rate threshold.
 REPLAY_BUFFER_CAPACITY = 100000  # Max games to store in buffer
 
 # --- Training (Optimizer) ---
-LEARNING_RATE = 0.001           # Adam optimizer learning rate
+LEARNING_RATE = 5e-4           # Adam optimizer learning rate
 WEIGHT_DECAY = 1e-4             # L2 regularization strength
 
 # --- Training Loop ---
@@ -60,22 +60,22 @@ NUM_GAMES_EVAL = 30             # Games for evaluation
 EXPLORATORY_EVERY = 10          # Self-play games per epoch
 
 # --- MCTS Simulations ---
-SELF_PLAY_SIMS = 30            # MCTS simulations per move during self-play
-EVAL_SIMS = 100                # MCTS simulations per move during evaluation
+SELF_PLAY_SIMS = 70           # MCTS simulations per move during self-play
+EVAL_SIMS = 75                # MCTS simulations per move during evaluation
 OPPONENT_GAME_SIMS = 100       # MCTS simulations per move vs local agents
 
 # --- MCTS Settings ---
 MCTS_TEMPERATURE = 1.0          # Exploration temperature for self-play
 MCTS_TEMPERATURE_EVAL = 0.3     # Exploration temperature for evaluation
 ADD_NOISE = True                # Add Dirichlet noise to root (self-play only)
-C_PUCT = 1.25                   # UCB exploration constant (unified for MCTS and BatchedMCTS)
+C_PUCT = 2.0                   # UCB exploration constant (unified for MCTS and BatchedMCTS)
 
 # --- Temperature Schedule (for move selection) ---
-TEMP_HIGH_TURNS = 12            # Use high temp for first N turns
+TEMP_HIGH_TURNS = 20            # Use high temp for first N turns
 TEMP_MID_TURNS = 0             # Use mid temp for next N turns
 TEMP_HIGH = 1.0                 # High temperature value
 TEMP_MID = 0.7                  # Medium temperature value
-TEMP_LOW = 0.1                  # Low temperature value (greedy)
+TEMP_LOW = 0.2                  # Low temperature value (greedy)
 
 # --- Opponent Diversity ---
 OPPONENT_GAME_EVERY = 0         # Play vs local agent every N games (0 to disable)
@@ -159,13 +159,13 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity)
         
     def save_game(self, game_history, winner_colour):
-        for state, pi, target_q, current_colour, action, valid_moves in game_history:
+        for state, pi, current_colour, action, valid_moves in game_history:
             z = 1.0 if current_colour == winner_colour else -1.0
             
             # 1. Convert state to numpy to avoid massive PyTorch storage overhead
             state_np = state.numpy() if isinstance(state, torch.Tensor) else state
             
-            self.buffer.append((state_np, pi, target_q, z, action, valid_moves))
+            self.buffer.append((state_np, pi, z, action, valid_moves))
             
             # Data Augmentation: Hex 180-degree rotation using NumPy
             rotated_state_np = np.rot90(state_np, 2, axes=(2, 3)).copy()
@@ -176,10 +176,6 @@ class ReplayBuffer:
             pi_board = pi[:-1].reshape(bs, bs)
             rotated_pi_board = np.rot90(pi_board, 2)
             rotated_pi = np.append(rotated_pi_board.flatten(), pi[-1]) 
-            
-            q_board = target_q[:-1].reshape(bs, bs)
-            rotated_q_board = np.rot90(q_board, 2)
-            rotated_q = np.append(rotated_q_board.flatten(), target_q[-1])
             
             if action != swap_idx:
                 x, y = divmod(action, bs)
@@ -197,7 +193,7 @@ class ReplayBuffer:
                 else:
                     rotated_valid_moves.append(swap_idx)
                     
-            self.buffer.append((rotated_state_np, rotated_pi, rotated_q, z, rotated_action, rotated_valid_moves))
+            self.buffer.append((rotated_state_np, rotated_pi, z, rotated_action, rotated_valid_moves))
             
     def sample(self, batch_size):
         if len(self.buffer) == 0:
@@ -205,14 +201,13 @@ class ReplayBuffer:
 
         batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
         
-        states, pis, qs, zs, actions, valid_moves_list = zip(*batch)
+        states, pis, zs, actions, valid_moves_list = zip(*batch)
         
         states_tensor = torch.tensor(np.concatenate(states, axis=0), dtype=torch.float32)
         pis_tensor = torch.tensor(np.array(pis), dtype=torch.float32)
-        qs_tensor = torch.tensor(np.array(qs), dtype=torch.float32)
         zs_tensor = torch.tensor(zs, dtype=torch.float32)
         
-        return states_tensor, pis_tensor, qs_tensor, zs_tensor, actions, valid_moves_list
+        return states_tensor, pis_tensor, zs_tensor, actions, valid_moves_list
         
     def __len__(self):
         return len(self.buffer)
@@ -253,9 +248,12 @@ class ReplayBuffer:
 
         cleaned_loaded = []
         for item in loaded:
-            state, pi, target_q, z, action, valid_moves = item
+            if len(item) == 6:
+                state, pi, _, z, action, valid_moves = item
+            else:
+                state, pi, z, action, valid_moves = item
             state_np = state.numpy() if isinstance(state, torch.Tensor) else state
-            cleaned_loaded.append((state_np, pi, target_q, z, action, valid_moves))
+            cleaned_loaded.append((state_np, pi, z, action, valid_moves))
 
         self.buffer = deque(cleaned_loaded, maxlen=self.buffer.maxlen)
         print(f"Loaded {len(self.buffer)} games from {filename} and normalized states.")
@@ -265,20 +263,19 @@ class HexTrainer:
     def __init__(self, model, lr=LEARNING_RATE):
         self.model = model
         self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
-        self.history = {'loss': [], 'v_loss': [], 'p_loss': [], 'q_loss': []}
+        self.history = {'loss': [], 'v_loss': [], 'p_loss': []}
 
-    def train_step(self, states, target_pis, target_qs, target_vs, valid_moves_list):
+    def train_step(self, states, target_pis, target_vs, valid_moves_list):
         self.model.train()
         device = next(self.model.parameters()).device
         states = states.to(device)
         target_pis = target_pis.to(device)
-        target_qs = target_qs.to(device)
         target_vs = target_vs.to(device)
 
         self.optimizer.zero_grad()
 
         # Forward pass
-        p_logits, v, q = self.model(states)
+        p_logits, v = self.model(states)
 
         # 1. Masking Invalid Moves in Policy
         # Create a boolean mask of the same shape as p_logits (Batch, BOARD_SIZE*BOARD_SIZE+1)
@@ -295,22 +292,15 @@ class HexTrainer:
         # 2. State-Value Loss (MSE)
         v_loss = F.mse_loss(v.view(-1), target_vs)
 
-        # 3. Action-Value Loss (MSE)
-        # We also want to mask invalid moves for the Q-loss so we don't train on garbage
-        q = q.masked_fill(mask, 0.0)
-        target_qs = target_qs.masked_fill(mask, 0.0)
-        q_loss = F.mse_loss(q, target_qs)
-
-        total_loss = p_loss + v_loss + q_loss
+        total_loss = p_loss + v_loss
         total_loss.backward()
         self.optimizer.step()
 
         self.history['loss'].append(total_loss.item())
         self.history['p_loss'].append(p_loss.item())
         self.history['v_loss'].append(v_loss.item())
-        self.history['q_loss'].append(q_loss.item())
 
-        return total_loss.item(), p_loss.item(), v_loss.item(), q_loss.item()
+        return total_loss.item(), p_loss.item(), v_loss.item()
 
     def save_checkpoint(self, iteration, path=None):
         if path is None:
@@ -381,7 +371,7 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
 
     mcts = MCTS(model, num_simulations=mcts_simulations, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE)
 
-    history      = []          # (state_tensor, pi, target_q, colour, action, valid_moves)
+    history      = []          # (state_tensor, pi, colour, action, valid_moves)
     current_colour = Colour.RED
     turn           = 1
     last_move: Move | None = None
@@ -393,15 +383,6 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
             # MCTS always runs at temperature=1.0 to get the raw visit distribution for the replay buffer.
             raw_pi_tensor = mcts.search(board, current_colour, turn)
             device = next(model.parameters()).device
-
-            # Extract Q-targets from MCTS root
-            root = mcts.last_root
-            target_q = np.zeros(BOARD_SIZE * BOARD_SIZE + 1, dtype=np.float32)
-            visits = root.children_visits
-            visited = visits > 0
-            target_q[visited] = root.children_values[visited] / visits[visited]
-            target_q[~visited] = root.children_q_priors[~visited]
-            target_q[~root.children_exists] = 0.0
 
             valid_moves = get_valid_moves(board, turn)
 
@@ -424,7 +405,7 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
                                      turn=turn if turn == 2 else None).cpu()
             
             # CRITICAL: We must store the RAW unsharpened pi in the history as the target!
-            history.append((state_cpu, raw_pi_tensor.numpy(), target_q, current_colour, action, valid_moves))
+            history.append((state_cpu, raw_pi_tensor.numpy(), current_colour, action, valid_moves))
 
             # Apply the model's move
             move_obj = Move(-1, -1) if action == BOARD_SIZE * BOARD_SIZE else Move(*divmod(action, BOARD_SIZE))
@@ -490,12 +471,10 @@ def recursive_free(node):
     node.children_priors = None
     node.children_visits = None
     node.children_values = None
-    node.children_q_priors = None
     node.children_exists = None
 
-# Q-score threshold: if RED's turn-1 move scores above this, Blue is forced to swap.
-# A Q of 0.9 means the network believes RED wins ~95% of the time — a dominant opener.
-SWAP_Q_THRESHOLD = 0.90
+# Visit count proportion threshold: if RED's turn-1 move gets more than this % of MCTS visits, Blue is forced to swap.
+SWAP_PI_THRESHOLD = 0.10
 
 
 def _decide_swap_turn2(game, swap_idx, mcts_root):
@@ -503,27 +482,21 @@ def _decide_swap_turn2(game, swap_idx, mcts_root):
 
     Strategy
     --------
-    Right after RED played move A on turn 1, the MCTS root (built for turn 2 /
-    Blue's position) already contains Q-prior estimates for every child.  We look
-    at the Q-value the network assigned to swap_idx (i.e. how good is swapping
-    for Blue?) and compare it to normal-move Q-values to decide.
+    We check the raw MCTS visit proportion that RED's opener received 
+    during turn 1. That value lives in ``game['red_opener_pi']``.
 
-    Actually simpler: we check the Q-value the network assigned to RED's opener
-    *from RED's perspective* before it became Blue's turn.  That value lives in
-    ``game['red_opener_q']`` which self_play stores right after turn 1.
-
-    If RED's opener was rated > SWAP_Q_THRESHOLD, Blue swaps (stealing that opener).
+    If RED's opener was highly visited (> SWAP_PI_THRESHOLD), Blue swaps.
     Otherwise Blue plays normally (sample from pi).
 
     Returns
     -------
     int  — the chosen action index (swap_idx or a normal board move)
     """
-    red_opener_q = game.get('red_opener_q', None)
+    red_opener_pi = game.get('red_opener_pi', None)
 
-    if red_opener_q is not None and red_opener_q > SWAP_Q_THRESHOLD:
+    if red_opener_pi is not None and red_opener_pi > SWAP_PI_THRESHOLD:
         logger.debug(
-            f"[Swap] RED opener Q={red_opener_q:.3f} > {SWAP_Q_THRESHOLD} → forcing SWAP"
+            f"[Swap] RED opener pi={red_opener_pi:.3f} > {SWAP_PI_THRESHOLD} → forcing SWAP"
         )
         return swap_idx
 
@@ -639,14 +612,6 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
                 raw_pi = batch_pis[idx]
                 root = game['root']
 
-                # Extract true MCTS Q-values
-                target_q = np.zeros(BOARD_SIZE * BOARD_SIZE + 1, dtype=np.float32)
-                visits = root.children_visits
-                visited = visits > 0
-                target_q[visited] = root.children_values[visited] / visits[visited]
-                target_q[~visited] = root.children_q_priors[~visited]
-                target_q[~root.children_exists] = 0.0
-
                 valid_moves = get_valid_moves(game['board'], game['turn'])
 
                 # --- Temperature schedule ---
@@ -674,10 +639,10 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
                 else:
                     action = torch.multinomial(sample_pi, 1).item()
 
-                # After turn 1 (RED's opener), record the Q-value of the chosen
+                # After turn 1 (RED's opener), record the pi of the chosen
                 # move so turn-2 Blue can decide whether to invoke the swap rule.
                 if turn == 1:
-                    game['red_opener_q'] = float(target_q[action])
+                    game['red_opener_pi'] = float(raw_pi[action])
 
                 device = next(model.parameters()).device
                 
@@ -686,7 +651,7 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PL
                                             turn=turn if turn == 2 else None).cpu()
 
                 # CRITICAL: We append the RAW unsharpened MCTS probabilities to the history!
-                game['history'].append((state_tensor, raw_pi.numpy(), target_q, game['colour'], action, valid_moves))
+                game['history'].append((state_tensor, raw_pi.numpy(), game['colour'], action, valid_moves))
 
                 new_board, next_col, next_turn, is_terminal, winner = apply_move(
                     game['board'], game['colour'], game['turn'], action
@@ -892,7 +857,7 @@ def run_training():
     logger.info(f"Using device: {device}")
 
     # Initialize best model
-    best_model = Hex3HNN(board_size=BOARD_SIZE).to(device)
+    best_model = HexPVNet(board_size=BOARD_SIZE).to(device)
 
     trainer = HexTrainer(best_model)
     iteration = trainer.load_checkpoint()
@@ -902,7 +867,7 @@ def run_training():
     buffer.load()
 
     # Initialize temporary model for training (should be separate instance)
-    temp_model = Hex3HNN(board_size=BOARD_SIZE).to(device)
+    temp_model = HexPVNet(board_size=BOARD_SIZE).to(device)
     temp_model.load_state_dict(best_model.state_dict())
     temp_trainer = HexTrainer(temp_model)
 
@@ -920,21 +885,20 @@ def run_training():
         logger.info("Starting Training...")
 
         # Train for some iterations on the buffer
-        # We need enough 6-element tuples (with target_q) to train
+        # We need enough tuples to train
         valid_buffer_size = len(buffer)
         if valid_buffer_size >= BATCH_SIZE:
-            total_loss = total_p = total_v = total_q = 0.0
+            total_loss = total_p = total_v = 0.0
 
             for b in range(TRAINING_STEPS):
-                states, pis, qs, zs, actions, valid_moves = buffer.sample(BATCH_SIZE)
-                loss, p_loss, v_loss, q_loss = temp_trainer.train_step(states, pis, qs, zs, valid_moves)
+                states, pis, zs, actions, valid_moves = buffer.sample(BATCH_SIZE)
+                loss, p_loss, v_loss = temp_trainer.train_step(states, pis, zs, valid_moves)
                 total_loss += loss
                 total_p += p_loss
                 total_v += v_loss
-                total_q += q_loss
 
             logger.info(f"Training Loss: {total_loss/TRAINING_STEPS:.4f} (P: {total_p/TRAINING_STEPS:.4f}, "
-                        f"V: {total_v/TRAINING_STEPS:.4f}, Q: {total_q/TRAINING_STEPS:.4f}) | Valid Buffer: {valid_buffer_size}")
+                        f"V: {total_v/TRAINING_STEPS:.4f}) | Valid Buffer: {valid_buffer_size}")
 
         # 3. Evaluate (only every EVAL_EVERY epochs)
         if (epoch - iteration) % EVAL_EVERY == 0:

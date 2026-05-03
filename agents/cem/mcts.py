@@ -12,8 +12,8 @@ from src.Move import Move
 # Global board configuration
 BOARD_SIZE = 11
 NUM_ACTIONS = 122  # board_size * board_size + 1
-ALPHA = 0.15
-EPSILON = 0.40
+ALPHA = 0.25
+EPSILON = 0.25
 
 def init_board_config(board_size):
     """Initialize MCTS with the target board size. Call this before creating MCTS instances."""
@@ -26,7 +26,6 @@ class Node:
         self.prior = prior
         self.visit_count = 0
         self.value_sum = 0
-        self.q_prior = 0.0
         
         # FIX 1: Use weakref to break cyclic references
         self.parent = weakref.ref(parent) if parent is not None else None
@@ -36,7 +35,6 @@ class Node:
         self.children_priors = np.zeros(NUM_ACTIONS, dtype=np.float32)
         self.children_visits = np.zeros(NUM_ACTIONS, dtype=np.int32)
         self.children_values = np.zeros(NUM_ACTIONS, dtype=np.float32)
-        self.children_q_priors = np.zeros(NUM_ACTIONS, dtype=np.float32)
         self.children_exists = np.zeros(NUM_ACTIONS, dtype=bool)
         
         # FIX 2: Use standard lists instead of uninitialized numpy object arrays
@@ -44,7 +42,7 @@ class Node:
         
     def value(self):
         if self.visit_count == 0:
-            return self.q_prior
+            return 0.0
         return self.value_sum / self.visit_count
 
 def get_valid_moves(board, turn):
@@ -160,9 +158,8 @@ class MCTS:
         # Initial expansion — pass turn so the swap-legal signal fires on turn 2
         state_tensor = encode_state(board, current_colour, self.device, out_tensor=self.state_buffer,
                                     turn=turn if turn == 2 else None)
-        policy_logits, _, q_preds = self.model(state_tensor)
+        policy_logits, value_pred = self.model(state_tensor)
         policy_probs = F.softmax(policy_logits[0], dim=0).cpu().numpy()
-        q_values = q_preds[0].cpu().numpy()
         
         valid_moves = get_valid_moves(board, turn)
                 
@@ -207,10 +204,8 @@ class MCTS:
             for a in top_k_moves:
                 p = noised_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
                 child_node = Node(p, parent=root, action_from_parent=a)
-                child_node.q_prior = q_values[a]
                 
                 root.children_priors[a] = p
-                root.children_q_priors[a] = q_values[a]
                 root.children_exists[a] = True
                 root.children_nodes[a] = child_node
             root.is_expanded = True
@@ -231,7 +226,9 @@ class MCTS:
                 q = np.zeros(NUM_ACTIONS, dtype=np.float32)
                 visited = visits > 0
                 q[visited] = node.children_values[visited] / visits[visited]
-                q[~visited] = node.children_q_priors[~visited]
+                # unvisited stays 0
+                # Clip Q to [-1, 1]
+                q = np.clip(q, -1.0, 1.0)
                 
                 sqrt_n = math.sqrt(max(1, node.visit_count))
                 u = self.c_puct * node.children_priors * sqrt_n / (1 + visits)
@@ -252,10 +249,9 @@ class MCTS:
             else:
                 state_tensor = encode_state(sim_board, sim_colour, self.device, out_tensor=self.state_buffer,
                                             turn=sim_turn if sim_turn == 2 else None)
-                policy_logits, value_pred, q_preds = self.model(state_tensor)
+                policy_logits, value_pred = self.model(state_tensor)
                 value = value_pred.item()
                 policy_probs = F.softmax(policy_logits[0], dim=0).cpu().numpy()
-                q_values = q_preds[0].cpu().numpy()
                 
                 valid_moves = get_valid_moves(sim_board, sim_turn)
                 if len(valid_moves) == 0:
@@ -284,10 +280,8 @@ class MCTS:
                     for a in top_k_moves:
                         p = policy_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
                         child_node = Node(p, parent=node, action_from_parent=a)
-                        child_node.q_prior = q_values[a]
                         
                         node.children_priors[a] = p
-                        node.children_q_priors[a] = q_values[a]
                         node.children_exists[a] = True
                         node.children_nodes[a] = child_node
                     node.is_expanded = True
@@ -355,9 +349,8 @@ class BatchedMCTS:
                 _t = game['turn'] if game['turn'] == 2 else None
                 encode_state(game['board'], game['colour'], self.device, out_tensor=state_tensor[idx_idx:idx_idx+1], turn=_t)
                 
-            policy_logits, _, q_preds = self.model(state_tensor)
+            policy_logits, value_preds = self.model(state_tensor)
             policy_probs = F.softmax(policy_logits, dim=1).cpu().numpy()
-            q_values = q_preds.cpu().numpy()
                         
             for idx_idx, idx in enumerate(unexpanded_roots):
                 game = active_games[idx]
@@ -366,7 +359,6 @@ class BatchedMCTS:
                 
                 if valid_moves:
                     p_probs = policy_probs[idx_idx]
-                    q_vals = q_values[idx_idx]
                                         
                     # 1. Mix noise into ALL valid moves FIRST
                     noised_probs = np.copy(p_probs)
@@ -407,10 +399,8 @@ class BatchedMCTS:
                     for a in top_k_moves:
                         p = noised_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
                         child = Node(p, parent=root, action_from_parent=a)
-                        child.q_prior = q_vals[a]
                         
                         root.children_priors[a] = p
-                        root.children_q_priors[a] = q_vals[a]
                         root.children_exists[a] = True
                         root.children_nodes[a] = child
                     root.is_expanded = True
@@ -441,7 +431,9 @@ class BatchedMCTS:
                     q = np.zeros(NUM_ACTIONS, dtype=np.float32)
                     visited = visits > 0
                     q[visited] = node.children_values[visited] / visits[visited]
-                    q[~visited] = node.children_q_priors[~visited]
+                    # unvisited stays 0
+                    # Clip Q to [-1, 1]
+                    q = np.clip(q, -1.0, 1.0)
                     
                     sqrt_n = math.sqrt(max(1, node.visit_count))
                     u = self.c_puct * node.children_priors * sqrt_n / (1 + visits)
@@ -472,10 +464,9 @@ class BatchedMCTS:
                     _t = sim_turns[idx] if sim_turns[idx] == 2 else None
                     encode_state(sim_boards[idx], sim_colours[idx], self.device, out_tensor=state_tensor[idx_idx:idx_idx+1], turn=_t)
                     
-                policy_logits, value_preds, q_preds = self.model(state_tensor)
+                policy_logits, value_preds = self.model(state_tensor)
                 policy_probs = F.softmax(policy_logits, dim=1).cpu().numpy()
                 value_preds = value_preds.cpu().numpy()
-                q_values = q_preds.cpu().numpy()
 
             # 2.3 Expansion and Backpropagation
             eval_idx = 0
@@ -488,7 +479,6 @@ class BatchedMCTS:
                 else:
                     value = value_preds[eval_idx][0]
                     p_probs = policy_probs[eval_idx]
-                    q_vals = q_values[eval_idx]
                     
                     valid_moves = get_valid_moves(sim_boards[i], sim_turns[i])
                     if not valid_moves:
@@ -517,10 +507,8 @@ class BatchedMCTS:
                         for a in top_k_moves:
                             p = p_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
                             child = Node(p, parent=leaf_node, action_from_parent=a)
-                            child.q_prior = q_vals[a]
                             
                             leaf_node.children_priors[a] = p
-                            leaf_node.children_q_priors[a] = q_vals[a]
                             leaf_node.children_exists[a] = True
                             leaf_node.children_nodes[a] = child
                         leaf_node.is_expanded = True

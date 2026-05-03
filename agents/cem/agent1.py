@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 # ── Debug toggle ────────────────────────────────────────────────────────────
 # Set to True to print log-probabilities of all 122 actions on turn 2.
-DEBUG_LOG_PROBS: bool = True
+DEBUG_LOG_PROBS: bool = False
 # ────────────────────────────────────────────────────────────────────────────
 
 from src.AgentBase import AgentBase
@@ -33,16 +33,15 @@ class ResBlock(nn.Module):
         return x
 
 
-class Hex3HNN(nn.Module):
+class HexPVNet(nn.Module):
     """
-    A 3-Head Convolutional Neural Network architecture for learning Hex.
+    A 2-Head Convolutional Neural Network architecture for learning Hex.
     Takes 2D spatial board state as input and outputs:
     1. Policy (action probabilities)
     2. State-Value (win probability for current player)
-    3. Action-Value (Q-values for each possible action)
     """
     def __init__(self, board_size: int = 11, temperature: float = 0.1, num_resBlocks: int = 4, num_hidden: int = 64):
-        super(Hex3HNN, self).__init__()
+        super(HexPVNet, self).__init__()
         self.board_size = board_size
         self.temperature = temperature
 
@@ -79,15 +78,7 @@ class Hex3HNN(nn.Module):
             nn.Tanh()
         )
         
-        # 3. Action-Value Head (Q-values)
-        self.actionValueHead = nn.Sequential(
-            nn.Conv2d(num_hidden, 2, kernel_size=1),
-            nn.BatchNorm2d(2),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(2 * board_size * board_size, board_size * board_size + 1),
-            nn.Tanh()
-        )
+
         
     def forward(self, x):
         x = self.startBlock(x)
@@ -96,9 +87,8 @@ class Hex3HNN(nn.Module):
             
         policy_logits = self.policyHead(x)
         value = self.valueHead(x)
-        action_value = self.actionValueHead(x)
         
-        return policy_logits, value, action_value
+        return policy_logits, value
 
 
 class Agent1(AgentBase):
@@ -124,8 +114,8 @@ class Agent1(AgentBase):
         # Final fallback to 11
         self.board_size = board_size if board_size is not None else 11
         
-        # Initialize the 3HNN architecture and move to device
-        self.model = Hex3HNN(board_size=self.board_size, temperature=self.temperature).to(self.device)
+        # Initialize the architecture and move to device
+        self.model = HexPVNet(board_size=self.board_size, temperature=self.temperature).to(self.device)
         self.model.eval()  # Default to evaluation mode
         
         # Load best model if exists
