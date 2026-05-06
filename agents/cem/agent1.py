@@ -92,38 +92,48 @@ class HexPVNet(nn.Module): # 2.43m params
 
 
 class Agent1(AgentBase):
-    def __init__(self, colour: Colour, board_size: int = None, temperature: float = 0.1):
+    def __init__(self, colour: Colour, temperature: float = 0.1,
+                 model_path: str = None, state_dict=None, board_size: int = None):
         super().__init__(colour)
         self.temperature = temperature
+        self.model_path_override = model_path
 
         # Check for GPU
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Determine board size
-        if board_size is None:
-            # Try to infer from checkpoint
-            model_path = os.path.join(os.path.dirname(__file__), "checkpoints/best_model.pt")
-            if os.path.isfile(model_path):
+
+        # ---- Determine board size ----
+        if board_size is not None:
+            self.board_size = board_size
+        else:
+            # Fallback: try to get from model_path
+            if model_path and os.path.isfile(model_path):
                 try:
                     checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-                    if 'board_size' in checkpoint:
-                        board_size = checkpoint['board_size']
+                    self.board_size = checkpoint.get('board_size', 11)
                 except Exception:
-                    pass
-        
-        # Final fallback to 11
-        self.board_size = board_size if board_size is not None else 11
-        
-        # Initialize the architecture and move to device
+                    self.board_size = 11
+            else:
+                self.board_size = 11
+
+        # ---- Initialize and load model ----
         self.model = HexPVNet(board_size=self.board_size, temperature=self.temperature).to(self.device)
-        self.model.eval()  # Default to evaluation mode
-        
-        # Load best model if exists
-        model_path = os.path.join(os.path.dirname(__file__), "checkpoints/best_model.pt")
-        if os.path.isfile(model_path):
-            print(f"Loading model from {model_path}...")
-            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        if state_dict is not None:
+            self.model.load_state_dict(state_dict)
+            self.model.eval()
+        else:
+            # Determine model path
+            path_to_load = model_path
+            if path_to_load is None:
+                path_to_load = os.path.join(os.path.dirname(__file__), "checkpoints/best_model.pt")
+            if path_to_load and os.path.isfile(path_to_load):
+                print(f"Loading model from {path_to_load}...")
+                checkpoint = torch.load(path_to_load, map_location=self.device, weights_only=False)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.model.eval()
+            else:
+                print("Warning: No model loaded – using random weights")
+                self.model.eval()
     
     def make_move(self, turn: int, board: Board, opp_move: Move | None) -> Move:
         """

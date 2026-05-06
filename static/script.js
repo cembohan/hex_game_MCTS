@@ -142,6 +142,10 @@ async function pollState() {
             updateBoard(state.board);
         }
         
+        if (state.human_colour) {
+            colorSelect.value = state.human_colour;
+        }
+        
         currentTurn = state.turn;
         
         if (state.game_over) {
