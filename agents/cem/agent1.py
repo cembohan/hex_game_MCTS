@@ -33,7 +33,7 @@ class ResBlock(nn.Module):
         return x
 
 
-class HexPVNet(nn.Module):
+class HexPVNet(nn.Module): # 2.43m params
     """
     A 2-Head Convolutional Neural Network architecture for learning Hex.
     Takes 2D spatial board state as input and outputs:

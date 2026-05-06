@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hex Game vs AI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="glass-container">
+        <header>
+            <h1>Play Hex</h1>
+            <p class="subtitle">Challenge the Neural Network</p>
+        </header>
+        
+        <div class="controls">
+            <div class="control-group">
+                <label for="color-select">Play As:</label>
+                <select id="color-select">
+                    <option value="RED">Red (Vertical)</option>
+                    <option value="BLUE">Blue (Horizontal)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label for="temp-slider">AI Temperature: <span id="temp-val">0.1</span></label>
+                <input type="range" id="temp-slider" min="0" max="1" step="0.1" value="0.1">
+            </div>
+            <button id="start-btn" class="glow-on-hover">Start Game</button>
+        </div>
+
+        <div id="status-panel" class="status-panel hidden">
+            <h2 id="turn-indicator">Waiting to start...</h2>
+            <button id="swap-btn" class="hidden glow-on-hover swap-btn">Use Swap Rule</button>
+        </div>
+
+        <div class="board-container">
+            <div id="board" class="board"></div>
+        </div>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>

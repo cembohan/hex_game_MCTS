@@ -42,9 +42,10 @@ import logging
 # --- Replay Buffer ---
 REPLAY_BUFFER_CAPACITY = 100000  # Max games to store in buffer
 
-# --- Training (Optimizer) ---
+# --- Training (Optimizer) & Loss ---
 LEARNING_RATE = 2e-4           # Adam optimizer learning rate - decrease as loss plateaus lower and lower
 WEIGHT_DECAY = 1e-4             # L2 regularization strength
+ENTROPY_COEF = 0.007
 
 # --- Training Loop ---
 EPOCHS = 3000                   # Total training epochs
@@ -287,13 +288,15 @@ class HexTrainer:
         # Overwrite illegal logits with a massive negative number
         p_logits = p_logits.masked_fill(mask, -1e9)
 
+        probs = F.softmax(p_logits, dim=1)
+        entropy = -torch.mean(torch.sum(probs * torch.log(probs + 1e-10), dim=1))
         # Now the softmax will perfectly ignore illegal moves
         p_loss = -torch.mean(torch.sum(target_pis * F.log_softmax(p_logits, dim=1), dim=1))
 
         # 2. State-Value Loss (MSE)
         v_loss = F.mse_loss(v.view(-1), target_vs)
 
-        total_loss = p_loss + v_loss
+        total_loss = p_loss + v_loss - ENTROPY_COEF * entropy
         total_loss.backward()
         self.optimizer.step()
 

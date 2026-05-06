@@ -81,7 +81,12 @@ if __name__ == "__main__":
         default=None,
         help="Maximum number of turns to play before terminating the game",
     )
-
+    
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Start the Flask web UI server instead of running a CLI game",
+    )
 
     parser.add_argument(
         "-l",
@@ -99,6 +104,15 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    
+    if args.web:
+        import app
+        import os
+        os.makedirs('static', exist_ok=True)
+        print("Starting Web Server at http://127.0.0.1:5000")
+        app.app.run(host='0.0.0.0', port=5000, debug=False)
+        sys.exit(0)
+
     p1_path, p1_class = args.player1.split(" ")
     p2_path, p2_class = args.player2.split(" ")
     p1 = importlib.import_module(p1_path)

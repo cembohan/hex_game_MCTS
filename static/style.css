@@ -1,0 +1,291 @@
+:root {
+    --bg-color: #0f172a;
+    --panel-bg: rgba(30, 41, 59, 0.7);
+    --border-color: rgba(255, 255, 255, 0.1);
+    --red-color: #ef4444;
+    --blue-color: #3b82f6;
+    --text-color: #f8fafc;
+    --text-muted: #94a3b8;
+    --hex-empty: rgba(255, 255, 255, 0.05);
+    --hex-hover: rgba(255, 255, 255, 0.2);
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: 'Inter', sans-serif;
+    background-color: var(--bg-color);
+    background-image: radial-gradient(circle at top right, #1e1b4b, var(--bg-color));
+    color: var(--text-color);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 2rem;
+}
+
+.glass-container {
+    background: var(--panel-bg);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--border-color);
+    border-radius: 24px;
+    padding: 2rem;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+    max-width: 1000px;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+header {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+h1 {
+    font-size: 3rem;
+    font-weight: 800;
+    background: linear-gradient(to right, var(--red-color), var(--blue-color));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 0.5rem;
+}
+
+.subtitle {
+    color: var(--text-muted);
+    font-size: 1.1rem;
+}
+
+.controls {
+    display: flex;
+    gap: 2rem;
+    background: rgba(0, 0, 0, 0.2);
+    padding: 1.5rem;
+    border-radius: 16px;
+    margin-bottom: 2rem;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: center;
+    border: 1px solid var(--border-color);
+}
+
+.control-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+label {
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: var(--text-muted);
+}
+
+select, input[type="range"] {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border-color);
+    color: white;
+    padding: 0.5rem;
+    border-radius: 8px;
+    outline: none;
+    font-family: 'Inter', sans-serif;
+}
+
+select:focus {
+    border-color: var(--blue-color);
+}
+
+.glow-on-hover {
+    padding: 0.8rem 2rem;
+    border: none;
+    outline: none;
+    color: #fff;
+    background: linear-gradient(45deg, #ff0000, #ff7300, #fffb00, #48ff00, #00ffd5, #002bff, #7a00ff, #ff00c8, #ff0000);
+    background-size: 400%;
+    border-radius: 10px;
+    font-weight: 600;
+    cursor: pointer;
+    position: relative;
+    z-index: 0;
+    transition: all 0.3s ease;
+    font-family: 'Inter', sans-serif;
+}
+
+.glow-on-hover:before {
+    content: '';
+    background: linear-gradient(45deg, #ff0000, #ff7300, #fffb00, #48ff00, #00ffd5, #002bff, #7a00ff, #ff00c8, #ff0000);
+    position: absolute;
+    top: -2px;
+    left:-2px;
+    background-size: 400%;
+    z-index: -1;
+    filter: blur(5px);
+    width: calc(100% + 4px);
+    height: calc(100% + 4px);
+    animation: glowing 20s linear infinite;
+    opacity: 0;
+    transition: opacity .3s ease-in-out;
+    border-radius: 10px;
+}
+
+.glow-on-hover:active {
+    color: #000;
+}
+
+.glow-on-hover:active:after {
+    background: transparent;
+}
+
+.glow-on-hover:hover:before {
+    opacity: 1;
+}
+
+.glow-on-hover:after {
+    z-index: -1;
+    content: '';
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    background: #111;
+    left: 0;
+    top: 0;
+    border-radius: 10px;
+}
+
+@keyframes glowing {
+    0% { background-position: 0 0; }
+    50% { background-position: 400% 0; }
+    100% { background-position: 0 0; }
+}
+
+.status-panel {
+    text-align: center;
+    margin-bottom: 2rem;
+    padding: 1rem 2rem;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 12px;
+    border: 1px solid var(--border-color);
+    transition: all 0.3s ease;
+}
+
+.status-panel h2 {
+    font-size: 1.5rem;
+    font-weight: 600;
+}
+
+.status-panel.human-turn {
+    border-color: #10b981;
+    box-shadow: 0 0 15px rgba(16, 185, 129, 0.3);
+}
+
+.status-panel.ai-turn {
+    border-color: #8b5cf6;
+    box-shadow: 0 0 15px rgba(139, 92, 246, 0.3);
+}
+
+.swap-btn {
+    margin-top: 1rem;
+    background: linear-gradient(45deg, #f59e0b, #d97706, #f59e0b) !important;
+}
+
+.swap-btn:after {
+    background: #111 !important;
+}
+
+.hidden {
+    display: none !important;
+}
+
+.board-container {
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    overflow-x: auto;
+    padding: 1rem;
+    /* Adding visual border indicators for Hex connections */
+    position: relative;
+}
+
+.board {
+    position: relative;
+    /* will be sized by JS */
+}
+
+/* Base Hexagon */
+.hex {
+    position: absolute;
+    width: 40px;
+    height: 46.188px; /* width * 1.1547 */
+    background-color: var(--hex-empty);
+    clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.hex:hover {
+    background-color: var(--hex-hover);
+    transform: scale(1.1);
+    z-index: 10;
+}
+
+.hex.red {
+    background-color: var(--red-color);
+    box-shadow: inset 0 0 10px rgba(0,0,0,0.5);
+    cursor: default;
+}
+
+.hex.red:hover {
+    transform: none;
+}
+
+.hex.blue {
+    background-color: var(--blue-color);
+    box-shadow: inset 0 0 10px rgba(0,0,0,0.5);
+    cursor: default;
+}
+
+.hex.blue:hover {
+    transform: none;
+}
+
+/* For visual reference of the board borders */
+.board::before {
+    content: '';
+    position: absolute;
+    top: -15px; left: 10%; right: 10%; height: 5px;
+    background: var(--red-color);
+    border-radius: 5px;
+    box-shadow: 0 0 10px var(--red-color);
+}
+.board::after {
+    content: '';
+    position: absolute;
+    bottom: -15px; left: 10%; right: 10%; height: 5px;
+    background: var(--red-color);
+    border-radius: 5px;
+    box-shadow: 0 0 10px var(--red-color);
+}
+.board-side-left {
+    position: absolute;
+    left: -15px; top: 10%; bottom: 10%; width: 5px;
+    background: var(--blue-color);
+    border-radius: 5px;
+    box-shadow: 0 0 10px var(--blue-color);
+    transform: skewY(30deg);
+}
+.board-side-right {
+    position: absolute;
+    right: -15px; top: 10%; bottom: 10%; width: 5px;
+    background: var(--blue-color);
+    border-radius: 5px;
+    box-shadow: 0 0 10px var(--blue-color);
+    transform: skewY(30deg);
+}
