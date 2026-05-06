@@ -203,11 +203,9 @@ class MCTS:
             
             for a in top_k_moves:
                 p = noised_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
-                child_node = Node(p, parent=root, action_from_parent=a)
-                
                 root.children_priors[a] = p
                 root.children_exists[a] = True
-                root.children_nodes[a] = child_node
+                # DO NOT instantiate the child_node here! Leave root.children_nodes[a] as None.
             root.is_expanded = True
                 
         for _ in range(self.num_simulations):
@@ -223,11 +221,11 @@ class MCTS:
                 mask = node.children_exists
                 visits = node.children_visits
                 
-                q = np.zeros(NUM_ACTIONS, dtype=np.float32)
-                visited = visits > 0
-                q[visited] = node.children_values[visited] / visits[visited]
-                # unvisited stays 0
-                # Clip Q to [-1, 1]
+                # --- Micro-Optimization for UCB Math ---
+                # Use np.divide to calculate Q directly into a zeroed array 
+                # without needing intermediate boolean array instantiation
+                q = np.divide(node.children_values, visits, 
+                              out=np.zeros_like(node.children_values), where=(visits > 0))
                 q = np.clip(q, -1.0, 1.0)
                 
                 sqrt_n = math.sqrt(max(1, node.visit_count))
@@ -237,6 +235,16 @@ class MCTS:
                 scores[~mask] = -np.inf
                 
                 best_action = int(np.argmax(scores))
+                
+                # --- LAZY INITIALIZATION ---
+                # Only create the Python object if we actually decided to visit it
+                if node.children_nodes[best_action] is None:
+                    node.children_nodes[best_action] = Node(
+                        prior=node.children_priors[best_action], 
+                        parent=node, 
+                        action_from_parent=best_action
+                    )
+                
                 node = node.children_nodes[best_action]
                 
                 sim_board, sim_colour, sim_turn, is_terminal, winner = apply_move(
@@ -279,11 +287,9 @@ class MCTS:
                     policy_sum = sum(policy_probs[a] for a in top_k_moves)
                     for a in top_k_moves:
                         p = policy_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
-                        child_node = Node(p, parent=node, action_from_parent=a)
-                        
                         node.children_priors[a] = p
                         node.children_exists[a] = True
-                        node.children_nodes[a] = child_node
+                        # DO NOT instantiate the child_node here! Leave node.children_nodes[a] as None.
                     node.is_expanded = True
                             
             # 3. Backpropagate
@@ -398,11 +404,9 @@ class BatchedMCTS:
                     
                     for a in top_k_moves:
                         p = noised_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
-                        child = Node(p, parent=root, action_from_parent=a)
-                        
                         root.children_priors[a] = p
                         root.children_exists[a] = True
-                        root.children_nodes[a] = child
+                        # DO NOT instantiate the child here! Leave root.children_nodes[a] as None.
                     root.is_expanded = True
 
         # 2. Simulation Loop
@@ -428,11 +432,8 @@ class BatchedMCTS:
                     mask = node.children_exists
                     visits = node.children_visits
                     
-                    q = np.zeros(NUM_ACTIONS, dtype=np.float32)
-                    visited = visits > 0
-                    q[visited] = node.children_values[visited] / visits[visited]
-                    # unvisited stays 0
-                    # Clip Q to [-1, 1]
+                    q = np.divide(node.children_values, visits, 
+                                  out=np.zeros_like(node.children_values), where=(visits > 0))
                     q = np.clip(q, -1.0, 1.0)
                     
                     sqrt_n = math.sqrt(max(1, node.visit_count))
@@ -442,6 +443,16 @@ class BatchedMCTS:
                     scores[~mask] = -np.inf
                     
                     best_action = int(np.argmax(scores))
+                    
+                    # --- LAZY INITIALIZATION ---
+                    # Only create the Python object if we actually decided to visit it
+                    if node.children_nodes[best_action] is None:
+                        node.children_nodes[best_action] = Node(
+                            prior=node.children_priors[best_action], 
+                            parent=node, 
+                            action_from_parent=best_action
+                        )
+                    
                     node = node.children_nodes[best_action]
                     path.append(node)
                     sim_board, sim_colour, sim_turn, is_terminal, winner = apply_move(
@@ -506,11 +517,9 @@ class BatchedMCTS:
                         policy_sum = sum(p_probs[a] for a in top_k_moves)
                         for a in top_k_moves:
                             p = p_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
-                            child = Node(p, parent=leaf_node, action_from_parent=a)
-                            
                             leaf_node.children_priors[a] = p
                             leaf_node.children_exists[a] = True
-                            leaf_node.children_nodes[a] = child
+                            # DO NOT instantiate the child here! Leave leaf_node.children_nodes[a] as None.
                         leaf_node.is_expanded = True
                             
                     eval_idx += 1
