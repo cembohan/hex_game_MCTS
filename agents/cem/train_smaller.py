@@ -5,6 +5,7 @@ This script reuses ALL training logic from train.py, overriding only the
 hyperparameters and paths that differ for the smaller board.  When you change
 how training works, you only need to edit train.py — this file stays untouched.
 """
+import os
 import agents.cem.train as train
 
 train.configure(
@@ -16,10 +17,10 @@ train.configure(
     TEMP_MID_TURNS=0,
 
     # --- Paths (separate from the 11x11 model) ---
-    CHECKPOINT_DIR="agents/cem/checkpoints_small/",
-    BUFFER_DIR="agents/cem/buffers_small/",
-    LOG_FILE="agents/cem/logs/training_small.log",
-    EVAL_LOG_FILE = "agents/cem/logs/evals_small.log"
+    CHECKPOINT_DIR=os.path.join(os.path.dirname(train.__file__), "checkpoints_small"),
+    BUFFER_DIR=os.path.join(os.path.dirname(train.__file__), "buffers_small"),
+    LOG_FILE=os.path.join(os.path.dirname(train.__file__), "logs", "training_small.log"),
+    EVAL_LOG_FILE=os.path.join(os.path.dirname(train.__file__), "logs", "evals_small.log")
 )
 
 if __name__ == "__main__":

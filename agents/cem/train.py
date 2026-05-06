@@ -55,13 +55,17 @@ EPOCHS = 3000                   # Total training epochs
 GAMES_PER_EPOCH = 24            # Self-play games per epoch
 BATCH_SIZE = 256                # Training batch size
 TRAINING_STEPS = 200            # Gradient updates per epoch
-EVAL_EVERY = 10                 # Evaluate every N epochs
-NUM_GAMES_EVAL = 30             # Games for evaluation
+EVAL_EVERY = 7                 # Evaluate every N epochs
+NUM_GAMES_EVAL = 60             # Games for evaluation
 EXPLORATORY_EVERY = 10          # Self-play games per epoch
 
 # --- MCTS Simulations ---
-SELF_PLAY_SIMS = 70           # MCTS simulations per move during self-play
-EVAL_SIMS = 75                # MCTS simulations per move during evaluation
+# --- Dynamic Sims Settings ---
+CURRENT_SIMS = 175
+MIN_SIMS = 100
+SIMS_DECAY_AMOUNT = 5
+EVALS_PASSED = 0  # Counter to track progress
+EVAL_SIMS = 125                # MCTS simulations per move during evaluation
 OPPONENT_GAME_SIMS = 100       # MCTS simulations per move vs local agents
 
 # --- MCTS Settings ---
@@ -72,7 +76,7 @@ C_PUCT = 2.0                   # UCB exploration constant (unified for MCTS and 
 MAX_EXPANSION_WIDTH = False     # Toggle for top-k node expansion. Set to an int (e.g., 16) for top-k, or False/None for full regular MCTS expansion
 
 # --- Temperature Schedule (for move selection) ---
-TEMP_HIGH_TURNS = 20            # Use high temp for first N turns
+TEMP_HIGH_TURNS = 12            # Use high temp for first N turns
 TEMP_MID_TURNS = 0             # Use mid temp for next N turns
 TEMP_HIGH = 1.0                 # High temperature value
 TEMP_MID = 0.7                  # Medium temperature value
@@ -88,10 +92,11 @@ EVAL_WIN_RATE_THRESHOLD = 0.51  # Win rate needed to replace best model (55%)
 BOARD_SIZE = 11
 
 # --- Folder Paths ---
-CHECKPOINT_DIR = "agents/cem/checkpoints/"
-BUFFER_DIR = "agents/cem/buffers/"
-LOG_FILE = "agents/cem/logs/training.log"
-EVAL_LOG_FILE = "agents/cem/logs/evals.log"
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINT_DIR = os.path.join(_BASE_DIR, "checkpoints")
+BUFFER_DIR = os.path.join(_BASE_DIR, "buffers")
+LOG_FILE = os.path.join(_BASE_DIR, "logs", "training.log")
+EVAL_LOG_FILE = os.path.join(_BASE_DIR, "logs", "evals.log")
 
 # Logger is set up lazily via _setup_logging() so that configure() can
 # change LOG_FILE / CHECKPOINT_DIR / BUFFER_DIR before anything runs.
@@ -122,7 +127,6 @@ def _setup_logging():
     """
     init_board_config(BOARD_SIZE)
 
-    os.makedirs("agents/cem", exist_ok=True)
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(BUFFER_DIR, exist_ok=True)
@@ -506,7 +510,7 @@ def _decide_swap_turn2(game, swap_idx, mcts_root):
     return None  # sentinel: caller uses multinomial
 
 
-def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PLAY_SIMS,
+def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=CURRENT_SIMS,
               opponent_game_every=OPPONENT_GAME_EVERY, iteration=0):
     """
     Run a batch of self-play games, with diversity injection:
@@ -848,6 +852,7 @@ def _save_and_exit(best_model, trainer, buffer, start_iteration, current_epoch):
 
 def run_training():
     """Main training loop.  Call configure() beforehand to override defaults."""
+    global EVALS_PASSED, CURRENT_SIMS
     _setup_logging()
 
     # Register signal handlers for graceful termination
@@ -876,8 +881,8 @@ def run_training():
         logger.info(f"--- Epoch {epoch+1} ---")
 
         # 1. Self Play
-        logger.info(f"Starting Self-Play (sims={SELF_PLAY_SIMS})...")
-        self_play(best_model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=SELF_PLAY_SIMS, iteration=epoch)
+        logger.info(f"Starting Self-Play (sims={CURRENT_SIMS})...")
+        self_play(best_model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=CURRENT_SIMS, iteration=epoch)
 
         # Save buffer periodically
         buffer.save()
@@ -914,6 +919,15 @@ def run_training():
                 eval_logger.info(outcome)
 
                 best_model.load_state_dict(temp_model.state_dict())
+                
+                EVALS_PASSED += 1
+                # Trigger Simulation Decay every 2 successful evaluations
+                if EVALS_PASSED % 2 == 0 and CURRENT_SIMS > MIN_SIMS:
+                    CURRENT_SIMS -= SIMS_DECAY_AMOUNT
+                    CURRENT_SIMS = max(CURRENT_SIMS, MIN_SIMS) # Don't drop below floor
+                    level_up_msg = f"-> NETWORK LEVELED UP. Decreasing Self-Play Sims to {CURRENT_SIMS}"
+                    logger.info(level_up_msg)
+                    eval_logger.info(level_up_msg)
 
                 trainer.save_checkpoint(epoch+1)
                 torch.save({
