@@ -34,10 +34,6 @@ from agents.cem.mcts import MCTS, BatchedMCTS, Node, encode_state, get_valid_mov
 import logging
 #TODO - Add notifications on eval completion (discord, desktop etc.)
 #TODO - (consider) Occasionally start the model from a random node in the MCTS tree instead of the root, to expose it to a wider variety of positions and avoid overfitting to the early game.
-"""TODO - (ASAP) after the robust implementation of swap rule, keep an eye on the eval cycles,
-if the eval isn't passing (which is now less likely due to newly introduced strategy space),
-delete the buffer.pt and potentially lower the eval win rate threshold.
-"""
 
 # =============================================================================
 # HYPERPARAMETERS
@@ -47,17 +43,17 @@ delete the buffer.pt and potentially lower the eval win rate threshold.
 REPLAY_BUFFER_CAPACITY = 100000  # Max games to store in buffer
 
 # --- Training (Optimizer) ---
-LEARNING_RATE = 5e-4           # Adam optimizer learning rate
+LEARNING_RATE = 2e-4           # Adam optimizer learning rate - decrease as loss plateaus lower and lower
 WEIGHT_DECAY = 1e-4             # L2 regularization strength
 
 # --- Training Loop ---
 EPOCHS = 3000                   # Total training epochs
-GAMES_PER_EPOCH = 24            # Self-play games per epoch
-BATCH_SIZE = 256                # Training batch size
-TRAINING_STEPS = 200            # Gradient updates per epoch
-EVAL_EVERY = 7                 # Evaluate every N epochs
-NUM_GAMES_EVAL = 60             # Games for evaluation
-EXPLORATORY_EVERY = 10          # Self-play games per epoch
+GAMES_PER_EPOCH = 40            # Self-play games per epoch - ideally don't change
+BATCH_SIZE = 256                # Training batch size 
+TRAINING_STEPS = 300           # Gradient updates per epoch
+EVAL_EVERY = 7                 # Evaluate every N epochs - can reduce after p_loss stabilizes to catch small gains faster.
+NUM_GAMES_EVAL = 60             # Games for evaluation - increase later on to ensure better eval results.
+EXPLORATORY_EVERY = 10          # this is a disabled feature
 
 # --- MCTS Simulations ---
 # --- Dynamic Sims Settings ---
@@ -866,6 +862,7 @@ def run_training():
     best_model = HexPVNet(board_size=BOARD_SIZE).to(device)
 
     trainer = HexTrainer(best_model)
+    print(f"Model params: {sum(p.numel() for p in best_model.parameters()):,}")
     iteration = trainer.load_checkpoint()
 
     # Initialize ReplayBuffer globally so it persists across epochs

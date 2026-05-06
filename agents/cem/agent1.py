@@ -40,7 +40,7 @@ class HexPVNet(nn.Module):
     1. Policy (action probabilities)
     2. State-Value (win probability for current player)
     """
-    def __init__(self, board_size: int = 11, temperature: float = 0.1, num_resBlocks: int = 4, num_hidden: int = 64):
+    def __init__(self, board_size: int = 11, temperature: float = 0.1, num_resBlocks: int = 8, num_hidden: int = 128):
         super(HexPVNet, self).__init__()
         self.board_size = board_size
         self.temperature = temperature
