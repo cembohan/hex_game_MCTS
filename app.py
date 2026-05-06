@@ -18,6 +18,9 @@ except ImportError:
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
+import logging
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
 game_state = {
     'turn': 0,

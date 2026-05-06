@@ -58,7 +58,7 @@ EXPLORATORY_EVERY = 10          # this is a disabled feature
 
 # --- MCTS Simulations ---
 # --- Dynamic Sims Settings ---
-CURRENT_SIMS = 175
+CURRENT_SIMS = 165
 MIN_SIMS = 100
 SIMS_DECAY_AMOUNT = 5
 EVALS_PASSED = 0  # Counter to track progress
