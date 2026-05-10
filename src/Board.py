@@ -300,7 +300,7 @@ if __name__ == "__main__":
         "0R000B00000,0R000000000,0RBB0000000,0R000000000,0R00B000000,"
         + "0R000BB0000,0R0000B0000,0R00000B000,0R000000B00,0R0000000B0,"
         + "0R00000000B",
-        bnf=True,
+        #bnf=True,
     )
     b.print_board(bnf=False)
     print(b.has_ended(), b.get_winner())

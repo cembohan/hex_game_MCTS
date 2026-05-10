@@ -34,13 +34,13 @@ from agents.cem.mcts import MCTS, BatchedMCTS, Node, encode_state, get_valid_mov
 import logging
 #TODO - Add notifications on eval completion (discord, desktop etc.)
 #TODO - (consider) Occasionally start the model from a random node in the MCTS tree instead of the root, to expose it to a wider variety of positions and avoid overfitting to the early game.
-
+#TODO - create a ELO system later on, simply put, instead of a single best_model, keep a variety of models and explore ways to find the best amongst them.
 # =============================================================================
 # HYPERPARAMETERS
 # =============================================================================
 
 # --- Replay Buffer ---
-REPLAY_BUFFER_CAPACITY = 100000  # Max games to store in buffer
+REPLAY_BUFFER_CAPACITY = 200000  # Max games to store in buffer
 
 # --- Training (Optimizer) & Loss ---
 LEARNING_RATE = 2e-4           # Adam optimizer learning rate - decrease as loss plateaus lower and lower
@@ -51,25 +51,25 @@ ENTROPY_COEF = 0.007
 EPOCHS = 3000                   # Total training epochs
 GAMES_PER_EPOCH = 40            # Self-play games per epoch - ideally don't change
 BATCH_SIZE = 256                # Training batch size 
-TRAINING_STEPS = 300           # Gradient updates per epoch
-EVAL_EVERY = 7                 # Evaluate every N epochs - can reduce after p_loss stabilizes to catch small gains faster.
-NUM_GAMES_EVAL = 60             # Games for evaluation - increase later on to ensure better eval results.
+TRAINING_STEPS = 50           # Gradient updates per epoch
+CHECKPOINT_EVERY = 10          # Save a numbered checkpoint every N epochs
 EXPLORATORY_EVERY = 10          # this is a disabled feature
 
+# --- Progress Evaluation (non-gating, informational only) ---
+EVAL_EVERY = 50                 # Evaluate current model vs past checkpoint every N epochs
+EVAL_LOOKBACK = 50              # Compare against checkpoint from N epochs ago
+NUM_GAMES_EVAL = 60             # Games per evaluation
+EVAL_SIMS = 125                 # MCTS simulations per move during evaluation
+MCTS_TEMPERATURE_EVAL = 0.3     # Lower temperature for more deterministic eval play
+
 # --- MCTS Simulations ---
-# --- Dynamic Sims Settings ---
-CURRENT_SIMS = 165
-MIN_SIMS = 100
-SIMS_DECAY_AMOUNT = 5
-EVALS_PASSED = 0  # Counter to track progress
-EVAL_SIMS = 125                # MCTS simulations per move during evaluation
+CURRENT_SIMS = 200
 OPPONENT_GAME_SIMS = 100       # MCTS simulations per move vs local agents
 
 # --- MCTS Settings ---
 MCTS_TEMPERATURE = 1.0          # Exploration temperature for self-play
-MCTS_TEMPERATURE_EVAL = 0.3     # Exploration temperature for evaluation
 ADD_NOISE = True                # Add Dirichlet noise to root (self-play only)
-C_PUCT = 2.0                   # UCB exploration constant (unified for MCTS and BatchedMCTS)
+C_PUCT = 1.25                 # UCB exploration constant (unified for MCTS and BatchedMCTS)
 MAX_EXPANSION_WIDTH = False     # Toggle for top-k node expansion. Set to an int (e.g., 16) for top-k, or False/None for full regular MCTS expansion
 
 # --- Temperature Schedule (for move selection) ---
@@ -81,9 +81,6 @@ TEMP_LOW = 0.2                  # Low temperature value (greedy)
 
 # --- Opponent Diversity ---
 OPPONENT_GAME_EVERY = 0         # Play vs local agent every N games (0 to disable)
-
-# --- Evaluation ---
-EVAL_WIN_RATE_THRESHOLD = 0.51  # Win rate needed to replace best model (55%)
 
 # --- Board Size (fixed for now) ---
 BOARD_SIZE = 11
@@ -98,7 +95,6 @@ EVAL_LOG_FILE = os.path.join(_BASE_DIR, "logs", "evals.log")
 # Logger is set up lazily via _setup_logging() so that configure() can
 # change LOG_FILE / CHECKPOINT_DIR / BUFFER_DIR before anything runs.
 logger = logging.getLogger("HexTraining")
-# Dedicated logger for evaluation results — routed to a separate file.
 eval_logger = logging.getLogger("HexEval")
 
 
@@ -145,14 +141,17 @@ def _setup_logging():
         ch.setFormatter(formatter)
         logger.addHandler(ch)
 
-    # --- Dedicated eval logger (file only, no console spam) ---
+    # --- Dedicated eval logger (file + console) ---
     eval_logger.setLevel(logging.INFO)
-    # Prevent propagation so eval entries don't double-write to root handlers
     eval_logger.propagate = False
     if not eval_logger.handlers:
         eval_fh = logging.FileHandler(EVAL_LOG_FILE)
         eval_fh.setFormatter(formatter)
         eval_logger.addHandler(eval_fh)
+
+        eval_ch = logging.StreamHandler()
+        eval_ch.setFormatter(formatter)
+        eval_logger.addHandler(eval_ch)
 
 import pickle # Ensure this is imported at the top
 
@@ -554,7 +553,7 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=CURRENT
         # that prevents the buffer from becoming an echo chamber.
         active_games = []
         for sp_idx in range(num_self_play_games):
-            if iteration < 200:
+            if iteration < 200000: # it was already turned off via max_expansion_width = None but 200000 is a fallback
                 is_exploratory = True
             else:
                 is_exploratory = (sp_idx % EXPLORATORY_EVERY == 0)
@@ -708,125 +707,147 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=CURRENT
 
     return buffer
 
-def evaluate_batched(temp_model, best_model, num_games=NUM_GAMES_EVAL, eval_sims=EVAL_SIMS):
-    temp_model.eval()
-    best_model.eval()
-    
-    # Initialize all games simultaneously
+
+def evaluate_vs_checkpoint(current_model, epoch, device):
+    """Play the current model against a checkpoint from EVAL_LOOKBACK epochs ago.
+
+    This is purely informational — it never gates or reverts training.
+    Results are logged to both the main training log and evals.log.
+    """
+    target_epoch = (epoch + 1) - EVAL_LOOKBACK
+    if target_epoch <= 0:
+        logger.info(f"Skipping eval: no checkpoint from {EVAL_LOOKBACK} epochs ago (need epoch >= {EVAL_LOOKBACK}).")
+        return
+
+    # Search for the closest checkpoint in [target-10, target+10], preferring the latest
+    search_lo = max(1, target_epoch - 10)
+    search_hi = target_epoch + 10
+    checkpoint_path = None
+    found_epoch = None
+    for e in range(search_hi, search_lo - 1, -1):  # iterate high-to-low
+        candidate = os.path.join(CHECKPOINT_DIR, f"checkpoint_{e}.pt")
+        if os.path.isfile(candidate):
+            checkpoint_path = candidate
+            found_epoch = e
+            break
+
+    if checkpoint_path is None:
+        logger.info(f"Skipping eval: no checkpoint found in range [{search_lo}, {search_hi}].")
+        return
+
+    # Load the old checkpoint into a throwaway model
+    old_model = HexPVNet(board_size=BOARD_SIZE).to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    old_model.load_state_dict(checkpoint['model_state_dict'])
+    old_model.eval()
+    current_model.eval()
+
+    logger.info(f"=== Progress Eval: epoch {epoch+1} vs checkpoint_{found_epoch} | {NUM_GAMES_EVAL} games, {EVAL_SIMS} sims ===")
+
+    # Set up all games — first half: current=RED, second half: current=BLUE
     games = []
-    for i in range(num_games):
+    for i in range(NUM_GAMES_EVAL):
         games.append({
             'board': Board(BOARD_SIZE),
             'colour': Colour.RED,
             'turn': 1,
-            'temp_is_red': (i < num_games // 2), # Balanced sides
+            'current_is_red': (i < NUM_GAMES_EVAL // 2),
             'root': Node(0),
-            'is_terminal': False,
-            'winner': None
+            'winner': None,
         })
 
-    active_games = games
-    
+    active_games = list(games)
+
     while active_games:
-        # Check for shutdown before each evaluation batch
         if _check_shutdown():
-            logger.info("Shutdown requested during evaluation. Returning current results...")
+            logger.info("Shutdown requested during eval. Returning partial results...")
             break
-            
-        # 1. SPLIT THE WORKLOAD
-        # Who is moving right now?
-        temp_batch = [g for g in active_games if (g['colour'] == Colour.RED and g['temp_is_red']) 
-                      or (g['colour'] == Colour.BLUE and not g['temp_is_red'])]
-        best_batch = [g for g in active_games if g not in temp_batch]
 
-        # 2. BATCHED SEARCH (No Noise, Low Temperature)
-        # We reuse your BatchedMCTS class
-        if temp_batch:
-            mcts_temp = BatchedMCTS(temp_model, num_simulations=eval_sims, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE_EVAL, add_noise=False, max_expansion_width=MAX_EXPANSION_WIDTH)
-            batch_pis_temp = mcts_temp.search(temp_batch)
-            for idx, g in enumerate(temp_batch):
-                g['pi'] = batch_pis_temp[idx]
+        # Split by who is moving
+        current_batch = [g for g in active_games
+                         if (g['colour'] == Colour.RED and g['current_is_red'])
+                         or (g['colour'] == Colour.BLUE and not g['current_is_red'])]
+        old_batch = [g for g in active_games if g not in current_batch]
 
-        if best_batch:
-            mcts_best = BatchedMCTS(best_model, num_simulations=eval_sims, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE_EVAL, add_noise=False, max_expansion_width=MAX_EXPANSION_WIDTH)
-            batch_pis_best = mcts_best.search(best_batch)
-            for idx, g in enumerate(best_batch):
-                g['pi'] = batch_pis_best[idx]
+        pi_map = {}
+        if current_batch:
+            mcts_cur = BatchedMCTS(current_model, num_simulations=EVAL_SIMS, c_puct=C_PUCT,
+                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False,
+                                   max_expansion_width=MAX_EXPANSION_WIDTH)
+            pis = mcts_cur.search(current_batch)
+            for g, pi in zip(current_batch, pis):
+                pi_map[id(g)] = pi
 
-        # 3. APPLY MOVES
+        if old_batch:
+            mcts_old = BatchedMCTS(old_model, num_simulations=EVAL_SIMS, c_puct=C_PUCT,
+                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False,
+                                   max_expansion_width=MAX_EXPANSION_WIDTH)
+            pis = mcts_old.search(old_batch)
+            for g, pi in zip(old_batch, pis):
+                pi_map[id(g)] = pi
+
         next_active = []
         for g in active_games:
-            # BatchedMCTS already applies MCTS_TEMPERATURE_EVAL when building the
-            # visit-count distribution, so g['pi'] is already appropriately sharpened.
-            # Sample directly — no second sharpening (that would be double-application).
-            action = torch.multinomial(g['pi'], 1).item()
-            new_board, next_col, next_turn, is_term, win = apply_move(
+            pi = pi_map[id(g)]
+            action = int(torch.multinomial(pi, 1).item())
+            new_board, next_col, next_turn, is_term, winner = apply_move(
                 g['board'], g['colour'], g['turn'], action
             )
-            
-            g['board'], g['colour'], g['turn'], g['is_terminal'], g['winner'] = \
-                new_board, next_col, next_turn, is_term, win
-            
-            if not is_term:
-                # Keep the tree! Step into the child node for the chosen action.
+
+            if is_term:
+                g['winner'] = winner
+                recursive_free(g['root'])
+                g['root'] = None
+            else:
+                g['board'] = new_board
+                g['colour'] = next_col
+                g['turn'] = next_turn
+                # Tree reuse
                 if g['root'].children_exists[action] and g['root'].children_nodes[action] is not None:
                     old_root = g['root']
                     new_root = old_root.children_nodes[action]
                     g['root'] = new_root
-                    # --- THE FIX: Detach the new root here too ---
+                    new_root.parent = None
                     old_root.children_nodes[action] = None
-                    
-                    # Break references so GC can clean up old tree
                     recursive_free(old_root)
                     del old_root
                 else:
-                    g['root'] = Node(0)  # Only fallback if something weird happens
-                
+                    g['root'] = Node(0)
                 next_active.append(g)
-        
+
         active_games = next_active
 
-    # 4. CALCULATE WIN RATE
-    # Exclude draws: a draw is neither a win nor a loss for either model, so
-    # counting it as a loss for the temp model biases the threshold downward.
-    temp_wins = 0
-    best_wins = 0
-    decided = 0
-    draws = 0
+    # Tally results
+    current_wins = best_wins = draws = 0
     for g in games:
         if g['winner'] is None:
             draws += 1
-            continue  # draw — exclude from denominator
-        decided += 1
-        if (g['winner'] == Colour.RED and g['temp_is_red']) or \
-           (g['winner'] == Colour.BLUE and not g['temp_is_red']):
-            temp_wins += 1
+        elif (g['winner'] == Colour.RED and g['current_is_red']) or \
+             (g['winner'] == Colour.BLUE and not g['current_is_red']):
+            current_wins += 1
         else:
             best_wins += 1
 
-    effective_games = decided if decided > 0 else num_games
-    win_rate = temp_wins / effective_games
+    decided = current_wins + best_wins
+    win_rate = current_wins / decided if decided > 0 else 0.0
 
-    eval_summary = (
-        f"Eval | Temp win rate: {win_rate*100:.1f}% "
-        f"| Temp: {temp_wins}W  Best: {best_wins}W  Draws: {draws} "
-        f"| {decided}/{num_games} decided"
+    summary = (
+        f"Progress Eval | Epoch {epoch+1} vs checkpoint_{found_epoch} | "
+        f"Win rate: {win_rate*100:.1f}% | "
+        f"Current: {current_wins}W  Old: {best_wins}W  Draws: {draws} | "
+        f"{decided}/{NUM_GAMES_EVAL} decided"
     )
-    # Route to both loggers: main log gets a brief note, eval log gets the full detail
-    logger.info(eval_summary)
-    eval_logger.info(eval_summary)
+    logger.info(summary)
+    eval_logger.info(summary)
 
-    del games
-    del active_games
+    # Cleanup
+    del old_model, games, active_games
     gc.collect()
-
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
-    return win_rate >= EVAL_WIN_RATE_THRESHOLD
 
 
-def _save_and_exit(best_model, trainer, buffer, start_iteration, current_epoch):
+def _save_and_exit(model, trainer, buffer, current_epoch):
     """Save all state and exit gracefully."""
     try:
         # Save the replay buffer
@@ -834,11 +855,10 @@ def _save_and_exit(best_model, trainer, buffer, start_iteration, current_epoch):
         logger.info("Replay buffer saved.")
         
         # Save model checkpoint
-        trainer.save_checkpoint(current_epoch + 1)
         torch.save({
             'iteration': current_epoch + 1,
             'board_size': BOARD_SIZE,
-            'model_state_dict': best_model.state_dict(),
+            'model_state_dict': model.state_dict(),
             'optimizer_state_dict': trainer.optimizer.state_dict(),
         }, os.path.join(CHECKPOINT_DIR, "best_model.pt"))
         logger.info("Model checkpoint saved.")
@@ -850,8 +870,11 @@ def _save_and_exit(best_model, trainer, buffer, start_iteration, current_epoch):
     sys.exit(0)
 
 def run_training():
-    """Main training loop.  Call configure() beforehand to override defaults."""
-    global EVALS_PASSED, CURRENT_SIMS
+    """Main training loop — continuous training (AlphaZero paradigm).
+
+    A single model generates self-play data and is trained on it
+    immediately.  No evaluation gate, no temp model.
+    """
     _setup_logging()
 
     # Register signal handlers for graceful termination
@@ -861,44 +884,46 @@ def run_training():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    # Initialize best model
-    best_model = HexPVNet(board_size=BOARD_SIZE).to(device)
+    # Single model — generates self-play AND is trained directly
+    model = HexPVNet(board_size=BOARD_SIZE).to(device)
 
-    trainer = HexTrainer(best_model)
-    print(f"Model params: {sum(p.numel() for p in best_model.parameters()):,}")
+    trainer = HexTrainer(model)
+    print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
     iteration = trainer.load_checkpoint()
+    if iteration > 0:
+        logger.info(f"Resuming from epoch {iteration} (next eval at epoch {EVAL_EVERY * ((iteration // EVAL_EVERY) + 1)})")
+    else:
+        logger.info(f"Starting fresh. First eval at epoch {EVAL_EVERY}.")
 
     # Initialize ReplayBuffer globally so it persists across epochs
     buffer = ReplayBuffer()
     buffer.load()
 
-    # Initialize temporary model for training (should be separate instance)
-    temp_model = HexPVNet(board_size=BOARD_SIZE).to(device)
-    temp_model.load_state_dict(best_model.state_dict())
-    temp_trainer = HexTrainer(temp_model)
-
     for epoch in range(iteration, iteration + EPOCHS):
         logger.info(f"--- Epoch {epoch+1} ---")
 
-        # 1. Self Play
+        # 1. Self-Play — generate data with the current model
         logger.info(f"Starting Self-Play (sims={CURRENT_SIMS})...")
-        self_play(best_model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=CURRENT_SIMS, iteration=epoch)
+        self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=CURRENT_SIMS, iteration=epoch)
+
+        # Check for shutdown after self-play (before training)
+        if _check_shutdown():
+            logger.info("Shutdown requested after self-play. Saving and exiting...")
+            _save_and_exit(model, trainer, buffer, epoch)
 
         # Save buffer periodically
         buffer.save()
 
-        # 2. Train Temp Model
+        # 2. Train — update the same model on the freshly-generated data
         logger.info("Starting Training...")
 
-        # Train for some iterations on the buffer
-        # We need enough tuples to train
         valid_buffer_size = len(buffer)
         if valid_buffer_size >= BATCH_SIZE:
             total_loss = total_p = total_v = 0.0
 
             for b in range(TRAINING_STEPS):
                 states, pis, zs, actions, valid_moves = buffer.sample(BATCH_SIZE)
-                loss, p_loss, v_loss = temp_trainer.train_step(states, pis, zs, valid_moves)
+                loss, p_loss, v_loss = trainer.train_step(states, pis, zs, valid_moves)
                 total_loss += loss
                 total_p += p_loss
                 total_v += v_loss
@@ -906,49 +931,28 @@ def run_training():
             logger.info(f"Training Loss: {total_loss/TRAINING_STEPS:.4f} (P: {total_p/TRAINING_STEPS:.4f}, "
                         f"V: {total_v/TRAINING_STEPS:.4f}) | Valid Buffer: {valid_buffer_size}")
 
-        # 3. Evaluate (only every EVAL_EVERY epochs)
-        if (epoch - iteration) % EVAL_EVERY == 0:
-            eval_header = f"=== Evaluation | Epoch {epoch+1} | sims={EVAL_SIMS} ==="
-            logger.info(f"Evaluating (sims={EVAL_SIMS})...")
-            eval_logger.info(eval_header)
-            is_better = evaluate_batched(temp_model, best_model, NUM_GAMES_EVAL, eval_sims=EVAL_SIMS)
+        # 3. Save checkpoint — always save best_model.pt, numbered checkpoint periodically
+        torch.save({
+            'iteration': epoch + 1,
+            'board_size': BOARD_SIZE,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': trainer.optimizer.state_dict(),
+        }, os.path.join(CHECKPOINT_DIR, "best_model.pt"))
 
-            if is_better:
-                outcome = "ACCEPTED — Temp model promoted to best_model."
-                logger.info("Temp model is better! Saving as new best_model.")
-                eval_logger.info(outcome)
+        if (epoch + 1) % CHECKPOINT_EVERY == 0:
+            trainer.save_checkpoint(epoch + 1)
+            logger.info(f"Numbered checkpoint saved at epoch {epoch+1}.")
 
-                best_model.load_state_dict(temp_model.state_dict())
-                
-                EVALS_PASSED += 1
-                # Trigger Simulation Decay every 2 successful evaluations
-                if EVALS_PASSED % 2 == 0 and CURRENT_SIMS > MIN_SIMS:
-                    CURRENT_SIMS -= SIMS_DECAY_AMOUNT
-                    CURRENT_SIMS = max(CURRENT_SIMS, MIN_SIMS) # Don't drop below floor
-                    level_up_msg = f"-> NETWORK LEVELED UP. Decreasing Self-Play Sims to {CURRENT_SIMS}"
-                    logger.info(level_up_msg)
-                    eval_logger.info(level_up_msg)
-
-                trainer.save_checkpoint(epoch+1)
-                torch.save({
-                    'iteration': epoch+1,
-                    'board_size': BOARD_SIZE,
-                    'model_state_dict': best_model.state_dict(),
-                    'optimizer_state_dict': trainer.optimizer.state_dict(),
-                }, os.path.join(CHECKPOINT_DIR, "best_model.pt"))
-
-            else:
-                outcome = "REJECTED — Temp model reverted to best_model."
-                logger.info("Temp model rejected. Reverting temp_model to best_model.")
-                eval_logger.info(outcome)
-                temp_model.load_state_dict(best_model.state_dict())
+        # 4. Progress evaluation — informational only, no gating
+        if (epoch + 1) % EVAL_EVERY == 0:
+            evaluate_vs_checkpoint(model, epoch, device)
 
         print("\n")
 
-        # Check for graceful shutdown after each epoch
+        # Check for graceful shutdown after training
         if _check_shutdown():
-            logger.info("Shutdown requested. Saving state and exiting...")
-            _save_and_exit(best_model, trainer, buffer, iteration, epoch)
+            logger.info("Shutdown requested after training. Saving and exiting...")
+            _save_and_exit(model, trainer, buffer, epoch)
 
     logger.info("Training completed normally.")
 
