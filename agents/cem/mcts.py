@@ -40,6 +40,10 @@ class Node:
         # FIX 2: Use standard lists instead of uninitialized numpy object arrays
         self.children_nodes = [None] * NUM_ACTIONS
         
+        # Lazy Terminal Caching: evaluated once during expansion, reused during selection
+        self.is_terminal = False
+        self.terminal_value = 0.0
+        
     def value(self):
         if self.visit_count == 0:
             return 0.0
@@ -217,7 +221,7 @@ class MCTS:
             winner = None
             
             # 1. Select
-            while node.is_expanded and not is_terminal:
+            while node.is_expanded and not node.is_terminal:
                 mask = node.children_exists
                 visits = node.children_visits
                 
@@ -252,47 +256,55 @@ class MCTS:
                 )
                 
             # 2. Evaluate and Expand
-            if is_terminal:
-                value = -1.0 
+            if node.is_terminal:
+                # Re-visiting a cached terminal node
+                value = node.terminal_value
             else:
-                state_tensor = encode_state(sim_board, sim_colour, self.device, out_tensor=self.state_buffer,
-                                            turn=sim_turn if sim_turn == 2 else None)
-                policy_logits, value_pred = self.model(state_tensor)
-                value = value_pred.item()
-                policy_probs = F.softmax(policy_logits[0], dim=0).cpu().numpy()
-                
-                valid_moves = get_valid_moves(sim_board, sim_turn)
-                if len(valid_moves) == 0:
-                    value = 0 
+                # Run win-check on the leaf's board state (lazy terminal detection)
+                if sim_board.has_ended(sim_colour) or sim_board.has_ended(Colour.opposite(sim_colour)):
+                    # The player who just moved (before sim_colour) won
+                    node.is_terminal = True
+                    node.terminal_value = -1.0  # Loss for the player-to-move at this node
+                    value = -1.0
                 else:
-                    # Inner-node expansion: max_expansion_width=None/False -> all moves; else top max_expansion_width+2 + 2 tail.
-                    if not self.max_expansion_width:
-                        top_k_moves = valid_moves
-                    else:
-                        k_main = min(self.max_expansion_width + 2, len(valid_moves))
-                        k_tail = 2
-                        top_indices = np.argsort(policy_probs[valid_moves])[-k_main:]
-                        top_moves = [valid_moves[i] for i in top_indices]
-                        remaining = list(set(valid_moves) - set(top_moves))
-                        if remaining:
-                            tail_moves = np.random.choice(
-                                remaining,
-                                size=min(k_tail, len(remaining)),
-                                replace=False
-                            )
-                        else:
-                            tail_moves = []
-                        top_k_moves = top_moves + list(tail_moves)
+                    state_tensor = encode_state(sim_board, sim_colour, self.device, out_tensor=self.state_buffer,
+                                                turn=sim_turn if sim_turn == 2 else None)
+                    policy_logits, value_pred = self.model(state_tensor)
+                    value = value_pred.item()
+                    policy_probs = F.softmax(policy_logits[0], dim=0).cpu().numpy()
                     
-                    policy_sum = sum(policy_probs[a] for a in top_k_moves)
-                    for a in top_k_moves:
-                        p = policy_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
-                        node.children_priors[a] = p
-                        node.children_exists[a] = True
-                        # DO NOT instantiate the child_node here! Leave node.children_nodes[a] as None.
-                    node.is_expanded = True
+                    valid_moves = get_valid_moves(sim_board, sim_turn)
+                    if len(valid_moves) == 0:
+                        value = 0 
+                    else:
+                        # Inner-node expansion: max_expansion_width=None/False -> all moves; else top max_expansion_width+2 + 2 tail.
+                        if not self.max_expansion_width:
+                            top_k_moves = valid_moves
+                        else:
+                            k_main = min(self.max_expansion_width + 2, len(valid_moves))
+                            k_tail = 2
+                            top_indices = np.argsort(policy_probs[valid_moves])[-k_main:]
+                            top_moves = [valid_moves[i] for i in top_indices]
+                            remaining = list(set(valid_moves) - set(top_moves))
+                            if remaining:
+                                tail_moves = np.random.choice(
+                                    remaining,
+                                    size=min(k_tail, len(remaining)),
+                                    replace=False
+                                )
+                            else:
+                                tail_moves = []
+                            top_k_moves = top_moves + list(tail_moves)
+                        
+                        policy_sum = sum(policy_probs[a] for a in top_k_moves)
+                        for a in top_k_moves:
+                            p = policy_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
+                            node.children_priors[a] = p
+                            node.children_exists[a] = True
+                            # DO NOT instantiate the child_node here! Leave node.children_nodes[a] as None.
+                        node.is_expanded = True
                             
-            # 3. Backpropagate
+            # 3. Backpropagate (correct order: invert-discount, then update parent)
             while node is not None:
                 node.value_sum += value
                 node.visit_count += 1
@@ -300,11 +312,13 @@ class MCTS:
                 # Resolve the weak reference to access the actual parent object
                 parent = node.parent() if node.parent is not None else None
                 
+                # Invert & discount BEFORE updating the parent's Q-table
+                value = -value * 0.99
+                
                 if parent is not None:
                     parent.children_values[node.action_from_parent] += value
                     parent.children_visits[node.action_from_parent] += 1
                     
-                value = -value # Invert value for the other player
                 node = parent  # Move up the tree
                 
             release_board(sim_board)
@@ -428,7 +442,7 @@ class BatchedMCTS:
                 winner = None
                 
                 path = [node]
-                while node.is_expanded and not is_terminal:
+                while node.is_expanded and not node.is_terminal:
                     mask = node.children_exists
                     visits = node.children_visits
                     
@@ -467,7 +481,11 @@ class BatchedMCTS:
                 winners.append(winner)
 
             # 2.2 Batched GPU Evaluation
-            unexpanded_indices = [i for i, terminal in enumerate(is_terminals) if not terminal]
+            # Skip externally-terminal games AND nodes already cached as terminal.
+            # Note: we do NOT run has_ended here — that happens lazily during expansion
+            # to keep eval_idx in sync with the GPU output arrays.
+            unexpanded_indices = [i for i in range(num_games)
+                                 if not is_terminals[i] and not search_paths[i][-1].is_terminal]
             
             if unexpanded_indices:
                 state_tensor = torch.zeros(len(unexpanded_indices), 3, self.board_size, self.board_size, device=self.device)
@@ -485,46 +503,55 @@ class BatchedMCTS:
                 path = search_paths[i]
                 leaf_node = path[-1]
                 
-                if is_terminals[i]:
+                if leaf_node.is_terminal:
+                    # Re-visiting a cached terminal node
+                    value = leaf_node.terminal_value
+                elif is_terminals[i]:
                     value = -1.0
                 else:
-                    value = value_preds[eval_idx][0]
-                    p_probs = policy_probs[eval_idx]
-                    
-                    valid_moves = get_valid_moves(sim_boards[i], sim_turns[i])
-                    if not valid_moves:
-                        value = 0.0
+                    # Lazy terminal detection: check win on the leaf's board
+                    if sim_boards[i].has_ended(sim_colours[i]) or sim_boards[i].has_ended(Colour.opposite(sim_colours[i])):
+                        leaf_node.is_terminal = True
+                        leaf_node.terminal_value = -1.0
+                        value = -1.0
                     else:
-                        # Inner-node expansion: max_expansion_width=None/False -> all moves; else top max_expansion_width+2 + 2 tail.
-                        if not self.max_expansion_width:
-                            top_k_moves = valid_moves
-                        else:
-                            k_main = min(self.max_expansion_width + 2, len(valid_moves))
-                            k_tail = 2
-                            top_indices = np.argsort(p_probs[valid_moves])[-k_main:]
-                            top_moves = [valid_moves[i] for i in top_indices]
-                            remaining = list(set(valid_moves) - set(top_moves))
-                            if remaining:
-                                tail_moves = np.random.choice(
-                                    remaining,
-                                    size=min(k_tail, len(remaining)),
-                                    replace=False
-                                )
-                            else:
-                                tail_moves = []
-                            top_k_moves = top_moves + list(tail_moves)
+                        value = value_preds[eval_idx][0]
+                        p_probs = policy_probs[eval_idx]
                         
-                        policy_sum = sum(p_probs[a] for a in top_k_moves)
-                        for a in top_k_moves:
-                            p = p_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
-                            leaf_node.children_priors[a] = p
-                            leaf_node.children_exists[a] = True
-                            # DO NOT instantiate the child here! Leave leaf_node.children_nodes[a] as None.
-                        leaf_node.is_expanded = True
+                        valid_moves = get_valid_moves(sim_boards[i], sim_turns[i])
+                        if not valid_moves:
+                            value = 0.0
+                        else:
+                            # Inner-node expansion: max_expansion_width=None/False -> all moves; else top max_expansion_width+2 + 2 tail.
+                            if not self.max_expansion_width:
+                                top_k_moves = valid_moves
+                            else:
+                                k_main = min(self.max_expansion_width + 2, len(valid_moves))
+                                k_tail = 2
+                                top_indices = np.argsort(p_probs[valid_moves])[-k_main:]
+                                top_moves = [valid_moves[i] for i in top_indices]
+                                remaining = list(set(valid_moves) - set(top_moves))
+                                if remaining:
+                                    tail_moves = np.random.choice(
+                                        remaining,
+                                        size=min(k_tail, len(remaining)),
+                                        replace=False
+                                    )
+                                else:
+                                    tail_moves = []
+                                top_k_moves = top_moves + list(tail_moves)
                             
-                    eval_idx += 1
+                            policy_sum = sum(p_probs[a] for a in top_k_moves)
+                            for a in top_k_moves:
+                                p = p_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
+                                leaf_node.children_priors[a] = p
+                                leaf_node.children_exists[a] = True
+                                # DO NOT instantiate the child here! Leave leaf_node.children_nodes[a] as None.
+                            leaf_node.is_expanded = True
+                                
+                        eval_idx += 1
                     
-                # Backpropagate
+                # Backpropagate (correct order: invert-discount, then update parent)
                 for node in reversed(path):
                     node.value_sum += value
                     node.visit_count += 1
@@ -532,11 +559,12 @@ class BatchedMCTS:
                     # Resolve the weak reference
                     parent = node.parent() if node.parent is not None else None
                     
+                    # Invert & discount BEFORE updating the parent's Q-table
+                    value = -value * 0.99
+                    
                     if parent is not None:
                         parent.children_values[node.action_from_parent] += value
                         parent.children_visits[node.action_from_parent] += 1
-                        
-                    value = -value
                     
             for sim_board in sim_boards:
                 release_board(sim_board)

@@ -61,6 +61,8 @@ EVAL_LOOKBACK = 50              # Compare against checkpoint from N epochs ago
 NUM_GAMES_EVAL = 60             # Games per evaluation
 EVAL_SIMS = 125                 # MCTS simulations per move during evaluation
 MCTS_TEMPERATURE_EVAL = 0.3     # Lower temperature for more deterministic eval play
+SET_CHECKPOINT = 397            # Fixed checkpoint to repeatedly evaluate against (change as needed)
+SET_EVAL_EVERY = 10             # How often (epochs) to evaluate vs SET_CHECKPOINT (separate from EVAL_EVERY)
 
 # --- MCTS Simulations ---
 CURRENT_SIMS = 200
@@ -708,12 +710,12 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=CURRENT
     return buffer
 
 
+"""
 def evaluate_vs_checkpoint(current_model, epoch, device):
-    """Play the current model against a checkpoint from EVAL_LOOKBACK epochs ago.
-
-    This is purely informational — it never gates or reverts training.
-    Results are logged to both the main training log and evals.log.
-    """
+    # Play the current model against a checkpoint from EVAL_LOOKBACK epochs ago.
+    #
+    # This is purely informational — it never gates or reverts training.
+    # Results are logged to both the main training log and evals.log.
     target_epoch = (epoch + 1) - EVAL_LOOKBACK
     if target_epoch <= 0:
         logger.info(f"Skipping eval: no checkpoint from {EVAL_LOOKBACK} epochs ago (need epoch >= {EVAL_LOOKBACK}).")
@@ -754,6 +756,7 @@ def evaluate_vs_checkpoint(current_model, epoch, device):
             'current_is_red': (i < NUM_GAMES_EVAL // 2),
             'root': Node(0),
             'winner': None,
+            'total_turns': 0,
         })
 
     active_games = list(games)
@@ -796,6 +799,7 @@ def evaluate_vs_checkpoint(current_model, epoch, device):
 
             if is_term:
                 g['winner'] = winner
+                g['total_turns'] = g['turn']
                 recursive_free(g['root'])
                 g['root'] = None
             else:
@@ -819,7 +823,9 @@ def evaluate_vs_checkpoint(current_model, epoch, device):
 
     # Tally results
     current_wins = best_wins = draws = 0
+    total_turns_sum = 0
     for g in games:
+        total_turns_sum += g['total_turns']
         if g['winner'] is None:
             draws += 1
         elif (g['winner'] == Colour.RED and g['current_is_red']) or \
@@ -830,15 +836,191 @@ def evaluate_vs_checkpoint(current_model, epoch, device):
 
     decided = current_wins + best_wins
     win_rate = current_wins / decided if decided > 0 else 0.0
+    avg_turns = total_turns_sum / len(games) if games else 0.0
 
     summary = (
         f"Progress Eval | Epoch {epoch+1} vs checkpoint_{found_epoch} | "
         f"Win rate: {win_rate*100:.1f}% | "
         f"Current: {current_wins}W  Old: {best_wins}W  Draws: {draws} | "
+        f"Avg turns: {avg_turns:.1f} | "
         f"{decided}/{NUM_GAMES_EVAL} decided"
     )
     logger.info(summary)
     eval_logger.info(summary)
+
+    # Cleanup
+    del old_model, games, active_games
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+"""
+
+
+# ---------------------------------------------------------------------------
+# Persistent eval tracking — survives restarts / early terminations
+# ---------------------------------------------------------------------------
+_SET_EVAL_STATE_FILE = os.path.join(_BASE_DIR, "logs", "set_eval_state.json")
+
+import json
+
+def _load_last_set_eval_epoch():
+    """Read the last epoch at which evaluate_vs_set_checkpoint ran.
+    Returns 0 if no record exists."""
+    try:
+        with open(_SET_EVAL_STATE_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get('last_eval_epoch', 0)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return 0
+
+def _save_last_set_eval_epoch(epoch):
+    """Persist the epoch number so the eval cadence survives restarts."""
+    os.makedirs(os.path.dirname(_SET_EVAL_STATE_FILE), exist_ok=True)
+    with open(_SET_EVAL_STATE_FILE, 'w') as f:
+        json.dump({'last_eval_epoch': epoch, 'set_checkpoint': SET_CHECKPOINT}, f)
+
+
+def _is_set_eval_due(current_epoch):
+    """Check whether it is time to run evaluate_vs_set_checkpoint.
+    Uses the persisted last-eval epoch so the cadence survives crashes."""
+    last = _load_last_set_eval_epoch()
+    return (current_epoch + 1) - last >= SET_EVAL_EVERY
+
+
+def evaluate_vs_set_checkpoint(current_model, epoch, device, last_p_loss=None, last_v_loss=None):
+    """Evaluate the current model against the fixed SET_CHECKPOINT.
+
+    This runs every EVAL_EVERY epochs (tracked persistently on disk) and
+    logs detailed information: current epoch, target checkpoint, recent
+    losses, and match results.
+    """
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_{SET_CHECKPOINT}.pt")
+    if not os.path.isfile(checkpoint_path):
+        logger.warning(f"SET_CHECKPOINT file not found: checkpoint_{SET_CHECKPOINT}.pt — skipping eval.")
+        return
+
+    # Load the fixed checkpoint into a throwaway model
+    old_model = HexPVNet(board_size=BOARD_SIZE).to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    old_model.load_state_dict(checkpoint['model_state_dict'])
+    old_model.eval()
+    current_model.eval()
+
+    # --- Header logging ---
+    loss_str = ""
+    if last_p_loss is not None and last_v_loss is not None:
+        loss_str = f" | Pre-eval losses -> P: {last_p_loss:.4f}, V: {last_v_loss:.4f}"
+    header = (
+        f"=== Set-Checkpoint Eval: epoch {epoch+1} vs checkpoint_{SET_CHECKPOINT} "
+        f"| {NUM_GAMES_EVAL} games, {EVAL_SIMS} sims{loss_str} ==="
+    )
+    logger.info(header)
+    eval_logger.info(header)
+
+    # Set up all games — first half: current=RED, second half: current=BLUE
+    games = []
+    for i in range(NUM_GAMES_EVAL):
+        games.append({
+            'board': Board(BOARD_SIZE),
+            'colour': Colour.RED,
+            'turn': 1,
+            'current_is_red': (i < NUM_GAMES_EVAL // 2),
+            'root': Node(0),
+            'winner': None,
+            'total_turns': 0,
+        })
+
+    active_games = list(games)
+
+    while active_games:
+        if _check_shutdown():
+            logger.info("Shutdown requested during set-checkpoint eval. Returning partial results...")
+            break
+
+        # Split by who is moving
+        current_batch = [g for g in active_games
+                         if (g['colour'] == Colour.RED and g['current_is_red'])
+                         or (g['colour'] == Colour.BLUE and not g['current_is_red'])]
+        old_batch = [g for g in active_games if g not in current_batch]
+
+        pi_map = {}
+        if current_batch:
+            mcts_cur = BatchedMCTS(current_model, num_simulations=EVAL_SIMS, c_puct=C_PUCT,
+                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False,
+                                   max_expansion_width=MAX_EXPANSION_WIDTH)
+            pis = mcts_cur.search(current_batch)
+            for g, pi in zip(current_batch, pis):
+                pi_map[id(g)] = pi
+
+        if old_batch:
+            mcts_old = BatchedMCTS(old_model, num_simulations=EVAL_SIMS, c_puct=C_PUCT,
+                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False,
+                                   max_expansion_width=MAX_EXPANSION_WIDTH)
+            pis = mcts_old.search(old_batch)
+            for g, pi in zip(old_batch, pis):
+                pi_map[id(g)] = pi
+
+        next_active = []
+        for g in active_games:
+            pi = pi_map[id(g)]
+            action = int(torch.multinomial(pi, 1).item())
+            new_board, next_col, next_turn, is_term, winner = apply_move(
+                g['board'], g['colour'], g['turn'], action
+            )
+
+            if is_term:
+                g['winner'] = winner
+                g['total_turns'] = g['turn']
+                recursive_free(g['root'])
+                g['root'] = None
+            else:
+                g['board'] = new_board
+                g['colour'] = next_col
+                g['turn'] = next_turn
+                # Tree reuse
+                if g['root'].children_exists[action] and g['root'].children_nodes[action] is not None:
+                    old_root = g['root']
+                    new_root = old_root.children_nodes[action]
+                    g['root'] = new_root
+                    new_root.parent = None
+                    old_root.children_nodes[action] = None
+                    recursive_free(old_root)
+                    del old_root
+                else:
+                    g['root'] = Node(0)
+                next_active.append(g)
+
+        active_games = next_active
+
+    # Tally results
+    current_wins = old_wins = draws = 0
+    total_turns_sum = 0
+    for g in games:
+        total_turns_sum += g['total_turns']
+        if g['winner'] is None:
+            draws += 1
+        elif (g['winner'] == Colour.RED and g['current_is_red']) or \
+             (g['winner'] == Colour.BLUE and not g['current_is_red']):
+            current_wins += 1
+        else:
+            old_wins += 1
+
+    decided = current_wins + old_wins
+    win_rate = current_wins / decided if decided > 0 else 0.0
+    avg_turns = total_turns_sum / len(games) if games else 0.0
+
+    summary = (
+        f"Set-Checkpoint Eval | Epoch {epoch+1} vs checkpoint_{SET_CHECKPOINT} | "
+        f"Win rate: {win_rate*100:.1f}% | "
+        f"Current: {current_wins}W  Old: {old_wins}W  Draws: {draws} | "
+        f"Avg turns: {avg_turns:.1f} | "
+        f"{decided}/{NUM_GAMES_EVAL} decided"
+    )
+    logger.info(summary)
+    eval_logger.info(summary)
+
+    # Persist last eval epoch
+    _save_last_set_eval_epoch(epoch + 1)
 
     # Cleanup
     del old_model, games, active_games
@@ -891,9 +1073,9 @@ def run_training():
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
     iteration = trainer.load_checkpoint()
     if iteration > 0:
-        logger.info(f"Resuming from epoch {iteration} (next eval at epoch {EVAL_EVERY * ((iteration // EVAL_EVERY) + 1)})")
+        logger.info(f"Resuming from epoch {iteration} (next eval at epoch {SET_EVAL_EVERY * ((iteration // SET_EVAL_EVERY) + 1)})")
     else:
-        logger.info(f"Starting fresh. First eval at epoch {EVAL_EVERY}.")
+        logger.info(f"Starting fresh. First eval at epoch {SET_EVAL_EVERY}.")
 
     # Initialize ReplayBuffer globally so it persists across epochs
     buffer = ReplayBuffer()
@@ -917,6 +1099,8 @@ def run_training():
         # 2. Train — update the same model on the freshly-generated data
         logger.info("Starting Training...")
 
+        last_p_loss = None
+        last_v_loss = None
         valid_buffer_size = len(buffer)
         if valid_buffer_size >= BATCH_SIZE:
             total_loss = total_p = total_v = 0.0
@@ -928,8 +1112,10 @@ def run_training():
                 total_p += p_loss
                 total_v += v_loss
 
-            logger.info(f"Training Loss: {total_loss/TRAINING_STEPS:.4f} (P: {total_p/TRAINING_STEPS:.4f}, "
-                        f"V: {total_v/TRAINING_STEPS:.4f}) | Valid Buffer: {valid_buffer_size}")
+            last_p_loss = total_p / TRAINING_STEPS
+            last_v_loss = total_v / TRAINING_STEPS
+            logger.info(f"Training Loss: {total_loss/TRAINING_STEPS:.4f} (P: {last_p_loss:.4f}, "
+                        f"V: {last_v_loss:.4f}) | Valid Buffer: {valid_buffer_size}")
 
         # 3. Save checkpoint — always save best_model.pt, numbered checkpoint periodically
         torch.save({
@@ -943,9 +1129,9 @@ def run_training():
             trainer.save_checkpoint(epoch + 1)
             logger.info(f"Numbered checkpoint saved at epoch {epoch+1}.")
 
-        # 4. Progress evaluation — informational only, no gating
-        if (epoch + 1) % EVAL_EVERY == 0:
-            evaluate_vs_checkpoint(model, epoch, device)
+        # 4. Progress evaluation vs fixed SET_CHECKPOINT — persistent cadence
+        if _is_set_eval_due(epoch):
+            evaluate_vs_set_checkpoint(model, epoch, device, last_p_loss=last_p_loss, last_v_loss=last_v_loss)
 
         print("\n")
 
