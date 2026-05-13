@@ -7,6 +7,9 @@ agents/cem/checkpoints/*
 agents/cem/checkpoints_small/*
 agents/cem/logs/*
 agents/cem/archive/*
+agents/cem/checkpoints_eval/*
+agents/cem/checkpoints_eval_small/*
+
 
 .bash_history
 .python_history

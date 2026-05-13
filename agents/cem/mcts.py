@@ -144,12 +144,11 @@ def encode_state(board, current_colour, device, out_tensor=None, turn=None):
     return out_tensor
 
 class MCTS:
-    def __init__(self, model, num_simulations=400, c_puct=2.0, temperature=1.0, max_expansion_width=None):
+    def __init__(self, model, num_simulations=1000, c_puct=2.0, temperature=1.0):
         self.model = model
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.temperature = temperature
-        self.max_expansion_width = max_expansion_width
         self.device = next(self.model.parameters()).device
         # Pre-allocate buffer to avoid reallocation bottleneck
         self.state_buffer = torch.zeros(1, 3, self.model.board_size, self.model.board_size, device=self.device)
@@ -176,42 +175,17 @@ class MCTS:
             for i, a in enumerate(valid_moves):
                 noised_probs[a] = (1 - EPSILON) * policy_probs[a] + EPSILON * noise[i]
                 
-            # 2. Select which moves to expand at the root.
-            # max_expansion_width=None or False means full expansion.
-            # Otherwise: top max_expansion_width by noised prob + 4 random tail moves.
-            if not self.max_expansion_width:
-                top_k_moves = valid_moves
-            else:
-                k_main = min(self.max_expansion_width, len(valid_moves))
-                k_tail = 4
-
-                # top moves
-                top_indices = np.argsort(noised_probs[valid_moves])[-k_main:]
-                top_moves = [valid_moves[i] for i in top_indices]
-
-                # tail sampling
-                remaining = list(set(valid_moves) - set(top_moves))
-                if remaining:
-                    tail_moves = np.random.choice(
-                        remaining,
-                        size=min(k_tail, len(remaining)),
-                        replace=False
-                    )
-                else:
-                    tail_moves = []
-
-                top_k_moves = top_moves + list(tail_moves)
+            # 2. Normalize noised probs over valid moves so they sum to 1.0
+            policy_sum = sum(noised_probs[a] for a in valid_moves)
             
-            # 3. Normalize only the selected top 20 so they sum to 1.0
-            policy_sum = sum(noised_probs[a] for a in top_k_moves)
-            
-            for a in top_k_moves:
-                p = noised_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
+            for a in valid_moves:
+                p = noised_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(valid_moves)
                 root.children_priors[a] = p
                 root.children_exists[a] = True
                 # DO NOT instantiate the child_node here! Leave root.children_nodes[a] as None.
             root.is_expanded = True
                 
+        terminal_hits = 0
         for _ in range(self.num_simulations):
             node = root
             sim_board = fast_clone_board(board)
@@ -259,6 +233,7 @@ class MCTS:
             if node.is_terminal:
                 # Re-visiting a cached terminal node
                 value = node.terminal_value
+                terminal_hits += 1
             else:
                 # Run win-check on the leaf's board state (lazy terminal detection)
                 if sim_board.has_ended(sim_colour) or sim_board.has_ended(Colour.opposite(sim_colour)):
@@ -266,6 +241,7 @@ class MCTS:
                     node.is_terminal = True
                     node.terminal_value = -1.0  # Loss for the player-to-move at this node
                     value = -1.0
+                    terminal_hits += 1
                 else:
                     state_tensor = encode_state(sim_board, sim_colour, self.device, out_tensor=self.state_buffer,
                                                 turn=sim_turn if sim_turn == 2 else None)
@@ -277,28 +253,9 @@ class MCTS:
                     if len(valid_moves) == 0:
                         value = 0 
                     else:
-                        # Inner-node expansion: max_expansion_width=None/False -> all moves; else top max_expansion_width+2 + 2 tail.
-                        if not self.max_expansion_width:
-                            top_k_moves = valid_moves
-                        else:
-                            k_main = min(self.max_expansion_width + 2, len(valid_moves))
-                            k_tail = 2
-                            top_indices = np.argsort(policy_probs[valid_moves])[-k_main:]
-                            top_moves = [valid_moves[i] for i in top_indices]
-                            remaining = list(set(valid_moves) - set(top_moves))
-                            if remaining:
-                                tail_moves = np.random.choice(
-                                    remaining,
-                                    size=min(k_tail, len(remaining)),
-                                    replace=False
-                                )
-                            else:
-                                tail_moves = []
-                            top_k_moves = top_moves + list(tail_moves)
-                        
-                        policy_sum = sum(policy_probs[a] for a in top_k_moves)
-                        for a in top_k_moves:
-                            p = policy_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
+                        policy_sum = sum(policy_probs[a] for a in valid_moves)
+                        for a in valid_moves:
+                            p = policy_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(valid_moves)
                             node.children_priors[a] = p
                             node.children_exists[a] = True
                             # DO NOT instantiate the child_node here! Leave node.children_nodes[a] as None.
@@ -323,6 +280,7 @@ class MCTS:
                 
             release_board(sim_board)
                 
+        print(f"MCTS search terminal_hits: {terminal_hits}")
         # Calculate visit probabilities
         action_probs = torch.zeros(NUM_ACTIONS)
         for a in range(NUM_ACTIONS):
@@ -341,13 +299,12 @@ class MCTS:
 
 
 class BatchedMCTS:
-    def __init__(self, model, num_simulations=100, temperature=1.0, c_puct=2.0, add_noise=True, max_expansion_width=None):
+    def __init__(self, model, num_simulations=100, temperature=1.0, c_puct=2.0, add_noise=True):
         self.model = model
         self.num_simulations = num_simulations
         self.temperature = temperature
         self.c_puct = c_puct
         self.add_noise = add_noise
-        self.max_expansion_width = max_expansion_width
         self.device = next(self.model.parameters()).device
         self.board_size = self.model.board_size
         
@@ -387,43 +344,18 @@ class BatchedMCTS:
                         for i, a in enumerate(valid_moves):
                             noised_probs[a] = (1 - EPSILON) * p_probs[a] + EPSILON * noise[i]
                     
-                    # 2. Select which moves to expand at the root.
-                    # max_expansion_width=None or False means full expansion.
-                    # Otherwise: top max_expansion_width by noised prob + 4 random tail moves.
-                    if not self.max_expansion_width:
-                        top_k_moves = valid_moves
-                    else:
-                        k_main = min(self.max_expansion_width, len(valid_moves))
-                        k_tail = 4
-
-                        # top moves
-                        top_indices = np.argsort(noised_probs[valid_moves])[-k_main:]
-                        top_moves = [valid_moves[i] for i in top_indices]
-
-                        # tail sampling
-                        remaining = list(set(valid_moves) - set(top_moves))
-                        if remaining:
-                            tail_moves = np.random.choice(
-                                remaining,
-                                size=min(k_tail, len(remaining)),
-                                replace=False
-                            )
-                        else:
-                            tail_moves = []
-
-                        top_k_moves = top_moves + list(tail_moves)
+                    # 2. Normalize noised probs over valid moves so they sum to 1.0
+                    policy_sum = sum(noised_probs[a] for a in valid_moves)
                     
-                    # 3. Normalize the selected top 20
-                    policy_sum = sum(noised_probs[a] for a in top_k_moves)
-                    
-                    for a in top_k_moves:
-                        p = noised_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
+                    for a in valid_moves:
+                        p = noised_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(valid_moves)
                         root.children_priors[a] = p
                         root.children_exists[a] = True
                         # DO NOT instantiate the child here! Leave root.children_nodes[a] as None.
                     root.is_expanded = True
 
         # 2. Simulation Loop
+        terminal_hits = 0
         for _ in range(self.num_simulations):
             search_paths = []
             sim_boards = []
@@ -506,14 +438,17 @@ class BatchedMCTS:
                 if leaf_node.is_terminal:
                     # Re-visiting a cached terminal node
                     value = leaf_node.terminal_value
+                    terminal_hits += 1
                 elif is_terminals[i]:
                     value = -1.0
+                    terminal_hits += 1
                 else:
                     # Lazy terminal detection: check win on the leaf's board
                     if sim_boards[i].has_ended(sim_colours[i]) or sim_boards[i].has_ended(Colour.opposite(sim_colours[i])):
                         leaf_node.is_terminal = True
                         leaf_node.terminal_value = -1.0
                         value = -1.0
+                        terminal_hits += 1
                     else:
                         value = value_preds[eval_idx][0]
                         p_probs = policy_probs[eval_idx]
@@ -522,28 +457,9 @@ class BatchedMCTS:
                         if not valid_moves:
                             value = 0.0
                         else:
-                            # Inner-node expansion: max_expansion_width=None/False -> all moves; else top max_expansion_width+2 + 2 tail.
-                            if not self.max_expansion_width:
-                                top_k_moves = valid_moves
-                            else:
-                                k_main = min(self.max_expansion_width + 2, len(valid_moves))
-                                k_tail = 2
-                                top_indices = np.argsort(p_probs[valid_moves])[-k_main:]
-                                top_moves = [valid_moves[i] for i in top_indices]
-                                remaining = list(set(valid_moves) - set(top_moves))
-                                if remaining:
-                                    tail_moves = np.random.choice(
-                                        remaining,
-                                        size=min(k_tail, len(remaining)),
-                                        replace=False
-                                    )
-                                else:
-                                    tail_moves = []
-                                top_k_moves = top_moves + list(tail_moves)
-                            
-                            policy_sum = sum(p_probs[a] for a in top_k_moves)
-                            for a in top_k_moves:
-                                p = p_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(top_k_moves)
+                            policy_sum = sum(p_probs[a] for a in valid_moves)
+                            for a in valid_moves:
+                                p = p_probs[a] / policy_sum if policy_sum > 0 else 1.0 / len(valid_moves)
                                 leaf_node.children_priors[a] = p
                                 leaf_node.children_exists[a] = True
                                 # DO NOT instantiate the child here! Leave leaf_node.children_nodes[a] as None.
@@ -569,6 +485,7 @@ class BatchedMCTS:
             for sim_board in sim_boards:
                 release_board(sim_board)
                     
+        print(f"BatchedMCTS search terminal_hits: {terminal_hits} (for {num_games} games, avg: {terminal_hits/num_games:.2f})")
         # 3. Final Action Selection Probs
         batch_pis = []
         for i in range(num_games):

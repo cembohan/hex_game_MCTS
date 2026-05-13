@@ -43,6 +43,20 @@ python Hex.py -p1 "agents.cem.agent1 Agent1" -p2 "agents.cem.agent1 Agent1" -v
 python Hex_temp.py -p1 "agents.cem.agent1 Agent1" -t1 0.1 -p2 "agents.cem.agent1 Agent1" -t2 0.9 -v
 python Hex_temp.py -p1 "agents.cem.agent1 Agent1" -t1 0.1 -p2 "agents.cem.agent1 Agent1" -t2 0.5 -v -turns 2 -l
 
+>> Use this to play against any checkpoint you put under that folder:
+```bash
+python Hex_temp.py -p1 "agents.cem.agent1 Agent1" -t1 0.1 -p2 "agents.cem.agent1 Agent1" -t2 0.9 -v -path2 "checkpoints_eval/checkpoint_10.pt"
+```
+To play with a smaller board (7x7):
+```bash
+python Hex_temp.py -p1 "agents.cem.agent1 Agent1" -path1 "checkpoints_small/best_model.pt" -p2 "agents.cem.agent1 Agent1" -path2 "checkpoints_small/checkpoint_10.pt" -b 7
+```
+
+# AI vs AI on 7x7 board (watch-only)
+python Hex_temp.py -p1 "agents.cem.agent1 Agent1" -path1 "agents/cem/checkpoints_small/best_model.pt" -p2 "agents.cem.agent1 Agent1" -path2 "agents/cem/checkpoints_small/checkpoint_10.pt" -b 7 --web
+# Human (Blue) vs AI model (Red) with custom temperature
+python Hex_temp.py -p1 "agents.cem.agent1 Agent1" -path1 "agents/cem/checkpoints_small/best_model.pt" -t1 0.5 -p2 "Human" -b 7 --web
+
 To exit the docker container you can simply do `exit`. This will stop the container.
 
 To enter the container again you can simply use:

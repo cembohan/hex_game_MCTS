@@ -7,11 +7,11 @@ from src.Colour import Colour
 from src.Game import Game
 from src.Player import Player
 
-def instantiate_agent(agent_class, colour, temperature):
-    """Safely initializes an agent, passing temperature only if supported."""
+def instantiate_agent(agent_class, colour, temperature, model_path=None):
+    """Safely initializes an agent, passing temperature and model_path only if supported."""
     sig = inspect.signature(agent_class.__init__)
-    if 'temperature' in sig.parameters:
-        return agent_class(colour, temperature=temperature)
+    if 'temperature' in sig.parameters or "model_path" in sig.parameters:
+        return agent_class(colour, temperature=temperature, model_path=model_path)
     return agent_class(colour)
 
 if __name__ == "__main__":
@@ -89,6 +89,22 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "-path1",
+        "--path1",
+        type=str,
+        default=None,
+        help="Path to the checkpoint to load for player 1",
+    )
+
+    parser.add_argument(
+        "-path2",
+        "--path2",
+        type=str,
+        default=None,
+        help="Path to the checkpoint to load for player 2",
+    )
+
+    parser.add_argument(
         "-l",
         "--log",
         nargs="?",
@@ -109,6 +125,37 @@ if __name__ == "__main__":
         import app
         import os
         os.makedirs('static', exist_ok=True)
+
+        def _parse_player(player_str, path, temp, name_fallback):
+            """Turn a CLI player spec into a config dict for app.web_config."""
+            lower = player_str.strip().lower()
+            if lower == "human":
+                return {'type': 'human', 'name': name_fallback}
+            parts = player_str.split()
+            if len(parts) != 2:
+                print(f"Error: player spec must be 'module ClassName' or 'Human', got: {player_str}")
+                sys.exit(1)
+            return {
+                'type': 'agent',
+                'module': parts[0],
+                'class': parts[1],
+                'path': path,
+                'temp': temp,
+                'name': name_fallback,
+            }
+
+        p1_cfg = _parse_player(args.player1, args.path1, args.temp1, args.player1Name)
+        p2_cfg = _parse_player(args.player2, args.path2, args.temp2, args.player2Name)
+
+        app.web_config = {
+            'board_size': args.board_size,
+            'p1': p1_cfg,
+            'p2': p2_cfg,
+        }
+
+        print(f"Board size : {args.board_size}")
+        print(f"Player 1   : {p1_cfg}")
+        print(f"Player 2   : {p2_cfg}")
         print("Starting Web Server at http://127.0.0.1:5000")
         app.app.run(host='0.0.0.0', port=5000, debug=False)
         sys.exit(0)
@@ -122,11 +169,11 @@ if __name__ == "__main__":
     g = Game(
         player1=Player(
             name=args.player1Name,
-            agent=instantiate_agent(p1_agent_class, Colour.RED, args.temp1),
+            agent=instantiate_agent(p1_agent_class, Colour.RED, args.temp1, args.path1),
         ),
         player2=Player(
             name=args.player2Name,
-            agent=instantiate_agent(p2_agent_class, Colour.BLUE, args.temp2),
+            agent=instantiate_agent(p2_agent_class, Colour.BLUE, args.temp2, args.path2),
         ),
         board_size=args.board_size,
         max_turns=args.max_turns,

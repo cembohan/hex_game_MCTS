@@ -53,7 +53,6 @@ GAMES_PER_EPOCH = 40            # Self-play games per epoch - ideally don't chan
 BATCH_SIZE = 256                # Training batch size 
 TRAINING_STEPS = 50           # Gradient updates per epoch
 CHECKPOINT_EVERY = 10          # Save a numbered checkpoint every N epochs
-EXPLORATORY_EVERY = 10          # this is a disabled feature
 
 # --- Progress Evaluation (non-gating, informational only) ---
 EVAL_EVERY = 50                 # Evaluate current model vs past checkpoint every N epochs
@@ -61,8 +60,9 @@ EVAL_LOOKBACK = 50              # Compare against checkpoint from N epochs ago
 NUM_GAMES_EVAL = 60             # Games per evaluation
 EVAL_SIMS = 125                 # MCTS simulations per move during evaluation
 MCTS_TEMPERATURE_EVAL = 0.3     # Lower temperature for more deterministic eval play
-SET_CHECKPOINT = 397            # Fixed checkpoint to repeatedly evaluate against (change as needed)
+SET_CHECKPOINT = 20            # Fixed checkpoint to repeatedly evaluate against (change as needed)
 SET_EVAL_EVERY = 10             # How often (epochs) to evaluate vs SET_CHECKPOINT (separate from EVAL_EVERY)
+
 
 # --- MCTS Simulations ---
 CURRENT_SIMS = 200
@@ -72,7 +72,6 @@ OPPONENT_GAME_SIMS = 100       # MCTS simulations per move vs local agents
 MCTS_TEMPERATURE = 1.0          # Exploration temperature for self-play
 ADD_NOISE = True                # Add Dirichlet noise to root (self-play only)
 C_PUCT = 1.25                 # UCB exploration constant (unified for MCTS and BatchedMCTS)
-MAX_EXPANSION_WIDTH = False     # Toggle for top-k node expansion. Set to an int (e.g., 16) for top-k, or False/None for full regular MCTS expansion
 
 # --- Temperature Schedule (for move selection) ---
 TEMP_HIGH_TURNS = 12            # Use high temp for first N turns
@@ -89,10 +88,12 @@ BOARD_SIZE = 11
 
 # --- Folder Paths ---
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINT_EVAL_DIR = os.path.join(_BASE_DIR, "checkpoints_eval")
 CHECKPOINT_DIR = os.path.join(_BASE_DIR, "checkpoints")
 BUFFER_DIR = os.path.join(_BASE_DIR, "buffers")
 LOG_FILE = os.path.join(_BASE_DIR, "logs", "training.log")
 EVAL_LOG_FILE = os.path.join(_BASE_DIR, "logs", "evals.log")
+SET_EVAL_STATE_FILE = os.path.join(_BASE_DIR, "logs", "set_eval_state.json")
 
 # Logger is set up lazily via _setup_logging() so that configure() can
 # change LOG_FILE / CHECKPOINT_DIR / BUFFER_DIR before anything runs.
@@ -158,7 +159,9 @@ def _setup_logging():
 import pickle # Ensure this is imported at the top
 
 class ReplayBuffer:
-    def __init__(self, capacity=REPLAY_BUFFER_CAPACITY):
+    def __init__(self, capacity=None):
+        if capacity is None:
+            capacity = REPLAY_BUFFER_CAPACITY
         self.buffer = deque(maxlen=capacity)
         
     def save_game(self, game_history, winner_colour):
@@ -374,7 +377,7 @@ def play_vs_agent(model, buffer, mcts_simulations=OPPONENT_GAME_SIMS):
     opp_agent = load_random_local_agent(opp_colour)
     logger.debug(f"Opponent-diversity game: model={model_colour}, opp={type(opp_agent).__name__}")
 
-    mcts = MCTS(model, num_simulations=mcts_simulations, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE, max_expansion_width=MAX_EXPANSION_WIDTH)
+    mcts = MCTS(model, num_simulations=mcts_simulations, c_puct=C_PUCT, temperature=MCTS_TEMPERATURE)
 
     history      = []          # (state_tensor, pi, colour, action, valid_moves)
     current_colour = Colour.RED
@@ -549,40 +552,21 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=CURRENT
 
     # --- 3. Batched self-play games ---
     if num_self_play_games > 0:
-        # Every 10th self-play game (0-indexed within self-play slots) uses
-        # full_expansion=True: the MCTS expands ALL valid moves at every node
-        # instead of capping at top-16+4.  This acts as an "exploration reset"
-        # that prevents the buffer from becoming an echo chamber.
         active_games = []
         for sp_idx in range(num_self_play_games):
-            if iteration < 200000: # it was already turned off via max_expansion_width = None but 200000 is a fallback
-                is_exploratory = True
-            else:
-                is_exploratory = (sp_idx % EXPLORATORY_EVERY == 0)
             active_games.append({
                 'board': Board(BOARD_SIZE),
                 'colour': Colour.RED,
                 'turn': 1,
                 'history': [],
                 'root': Node(0),
-                'is_exploratory': is_exploratory,
             })
 
-        num_exploratory = sum(1 for g in active_games if g['is_exploratory'])
-        logger.info(
-            f"Self-play batch: {num_self_play_games} games "
-            f"({num_exploratory} exploratory / {num_self_play_games - num_exploratory} normal)"
-        )
+        logger.info(f"Self-play batch: {num_self_play_games} games")
 
-        # Two MCTS instances — one per expansion mode.  Both are stateless
-        # (no tree reuse across games) so sharing is safe.
-        mcts_normal = BatchedMCTS(
+        mcts_batch = BatchedMCTS(
             model, num_simulations=mcts_simulations, c_puct=C_PUCT,
-            temperature=MCTS_TEMPERATURE, max_expansion_width=MAX_EXPANSION_WIDTH
-        )
-        mcts_exploratory = BatchedMCTS(
-            model, num_simulations=mcts_simulations, c_puct=C_PUCT,
-            temperature=MCTS_TEMPERATURE, max_expansion_width=None
+            temperature=MCTS_TEMPERATURE
         )
 
         while active_games:
@@ -595,22 +579,7 @@ def self_play(model, buffer, num_games=GAMES_PER_EPOCH, mcts_simulations=CURRENT
                     recursive_free(game['root'])
                 break
 
-            # Split by expansion mode and search each sub-batch separately
-            normal_games      = [g for g in active_games if not g['is_exploratory']]
-            exploratory_games = [g for g in active_games if     g['is_exploratory']]
-
-            # Maps game-object → its pi tensor so we can reunify below
-            pi_map = {}
-            if normal_games:
-                pis = mcts_normal.search(normal_games)
-                for g, pi in zip(normal_games, pis):
-                    pi_map[id(g)] = pi
-            if exploratory_games:
-                pis = mcts_exploratory.search(exploratory_games)
-                for g, pi in zip(exploratory_games, pis):
-                    pi_map[id(g)] = pi
-
-            batch_pis = [pi_map[id(g)] for g in active_games]
+            batch_pis = mcts_batch.search(active_games)
 
             next_active = []
             for idx, game in enumerate(active_games):
@@ -775,16 +744,14 @@ def evaluate_vs_checkpoint(current_model, epoch, device):
         pi_map = {}
         if current_batch:
             mcts_cur = BatchedMCTS(current_model, num_simulations=EVAL_SIMS, c_puct=C_PUCT,
-                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False,
-                                   max_expansion_width=MAX_EXPANSION_WIDTH)
+                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False)
             pis = mcts_cur.search(current_batch)
             for g, pi in zip(current_batch, pis):
                 pi_map[id(g)] = pi
 
         if old_batch:
             mcts_old = BatchedMCTS(old_model, num_simulations=EVAL_SIMS, c_puct=C_PUCT,
-                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False,
-                                   max_expansion_width=MAX_EXPANSION_WIDTH)
+                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False)
             pis = mcts_old.search(old_batch)
             for g, pi in zip(old_batch, pis):
                 pi_map[id(g)] = pi
@@ -859,7 +826,6 @@ def evaluate_vs_checkpoint(current_model, epoch, device):
 # ---------------------------------------------------------------------------
 # Persistent eval tracking — survives restarts / early terminations
 # ---------------------------------------------------------------------------
-_SET_EVAL_STATE_FILE = os.path.join(_BASE_DIR, "logs", "set_eval_state.json")
 
 import json
 
@@ -867,7 +833,7 @@ def _load_last_set_eval_epoch():
     """Read the last epoch at which evaluate_vs_set_checkpoint ran.
     Returns 0 if no record exists."""
     try:
-        with open(_SET_EVAL_STATE_FILE, 'r') as f:
+        with open(SET_EVAL_STATE_FILE, 'r') as f:
             data = json.load(f)
             return data.get('last_eval_epoch', 0)
     except (FileNotFoundError, json.JSONDecodeError):
@@ -875,8 +841,8 @@ def _load_last_set_eval_epoch():
 
 def _save_last_set_eval_epoch(epoch):
     """Persist the epoch number so the eval cadence survives restarts."""
-    os.makedirs(os.path.dirname(_SET_EVAL_STATE_FILE), exist_ok=True)
-    with open(_SET_EVAL_STATE_FILE, 'w') as f:
+    os.makedirs(os.path.dirname(SET_EVAL_STATE_FILE), exist_ok=True)
+    with open(SET_EVAL_STATE_FILE, 'w') as f:
         json.dump({'last_eval_epoch': epoch, 'set_checkpoint': SET_CHECKPOINT}, f)
 
 
@@ -894,7 +860,7 @@ def evaluate_vs_set_checkpoint(current_model, epoch, device, last_p_loss=None, l
     logs detailed information: current epoch, target checkpoint, recent
     losses, and match results.
     """
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_{SET_CHECKPOINT}.pt")
+    checkpoint_path = os.path.join(CHECKPOINT_EVAL_DIR, f"checkpoint_{SET_CHECKPOINT}.pt")
     if not os.path.isfile(checkpoint_path):
         logger.warning(f"SET_CHECKPOINT file not found: checkpoint_{SET_CHECKPOINT}.pt — skipping eval.")
         return
@@ -946,16 +912,14 @@ def evaluate_vs_set_checkpoint(current_model, epoch, device, last_p_loss=None, l
         pi_map = {}
         if current_batch:
             mcts_cur = BatchedMCTS(current_model, num_simulations=EVAL_SIMS, c_puct=C_PUCT,
-                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False,
-                                   max_expansion_width=MAX_EXPANSION_WIDTH)
+                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False)
             pis = mcts_cur.search(current_batch)
             for g, pi in zip(current_batch, pis):
                 pi_map[id(g)] = pi
 
         if old_batch:
             mcts_old = BatchedMCTS(old_model, num_simulations=EVAL_SIMS, c_puct=C_PUCT,
-                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False,
-                                   max_expansion_width=MAX_EXPANSION_WIDTH)
+                                   temperature=MCTS_TEMPERATURE_EVAL, add_noise=False)
             pis = mcts_old.search(old_batch)
             for g, pi in zip(old_batch, pis):
                 pi_map[id(g)] = pi
@@ -1080,6 +1044,7 @@ def run_training():
     # Initialize ReplayBuffer globally so it persists across epochs
     buffer = ReplayBuffer()
     buffer.load()
+    print(f"Buffer capacity: {buffer.buffer.maxlen}, current size: {len(buffer.buffer)}")
 
     for epoch in range(iteration, iteration + EPOCHS):
         logger.info(f"--- Epoch {epoch+1} ---")

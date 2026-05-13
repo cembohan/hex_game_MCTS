@@ -96,6 +96,13 @@ class Agent1(AgentBase):
                  model_path: str = None, state_dict=None, board_size: int = None):
         super().__init__(colour)
         self.temperature = temperature
+
+        # Resolve model_path if it's provided but not found in the current working directory
+        if model_path is not None and not os.path.isfile(model_path):
+            alt_path = os.path.join(os.path.dirname(__file__), model_path)
+            if os.path.isfile(alt_path):
+                model_path = alt_path
+
         self.model_path_override = model_path
 
         # Check for GPU
@@ -140,7 +147,7 @@ class Agent1(AgentBase):
         Predicts the best move using MCTS guided by the 3HNN model.
         """
         # We use a relatively small number of simulations for tournament play to stay within time limits
-        mcts = MCTS(self.model, num_simulations=100, temperature=self.temperature) # low temp for greedy play
+        mcts = MCTS(self.model, num_simulations=800, temperature=self.temperature) # low temp for greedy play
         
         # MCTS handles board encoding internally
         action_probs = mcts.search(board, self.colour, turn)
