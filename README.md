@@ -1,6 +1,6 @@
 # CSE4080 Multi-Agent Systems Project
 
-### this is a WIP, repo needs cleaning up and readme needs updates. dependencies not yet tested as well.
+### this is a WIP, repo needs cleaning up and readme needs updates. dependencies not fully tested for production.
 
 Inside the Dockerfile, two versions of PyTorch and Tensorflow are available. Select the one you need based on the availability and use of the GPU.
 
