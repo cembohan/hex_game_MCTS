@@ -1,14 +1,17 @@
 .vscode/
 .nv/
 .github/
-agents/cem/buffers/*
-agents/cem/buffers_small/*
-agents/cem/checkpoints/*
-agents/cem/checkpoints_small/*
-agents/cem/logs/*
-agents/cem/archive/*
-agents/cem/checkpoints_eval/*
-agents/cem/checkpoints_eval_small/*
+agents/AZ_agent/buffers/*
+agents/AZ_agent/buffers_small/*
+agents/AZ_agent/buffers_9x9/*
+agents/AZ_agent/checkpoints/*
+agents/AZ_agent/checkpoints_small/*
+agents/AZ_agent/checkpoints_9x9/*
+agents/AZ_agent/logs/*
+agents/AZ_agent/archive/*
+agents/AZ_agent/checkpoints_eval/*
+agents/AZ_agent/checkpoints_eval_small/*
+agents/AZ_agent/checkpoints_eval_9x9/*
 
 
 .bash_history

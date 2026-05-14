@@ -11,10 +11,10 @@ import inspect
 from src.Game import Game
 from src.Player import Player
 from src.Colour import Colour
-from agents.cem.WebAgent import WebAgent
+from agents.AZ_agent.WebAgent import WebAgent
 
 try:
-    from agents.cem.agent1 import Agent1
+    from agents.AZ_agent.agent1 import Agent1
 except ImportError:
     pass
 
