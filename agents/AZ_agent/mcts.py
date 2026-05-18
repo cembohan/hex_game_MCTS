@@ -144,7 +144,7 @@ def encode_state(board, current_colour, device, out_tensor=None, turn=None):
     return out_tensor
 
 class MCTS:
-    def __init__(self, model, num_simulations=1000, c_puct=2.0, temperature=1.0):
+    def __init__(self, model, num_simulations=1000, c_puct=1.25, temperature=1.0):
         self.model = model
         self.num_simulations = num_simulations
         self.c_puct = c_puct

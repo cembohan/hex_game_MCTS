@@ -14,6 +14,8 @@ train.configure(
     REPLAY_BUFFER_CAPACITY=30000,
     EVAL_SIMS = 1000,
     NUM_GAMES_EVAL = 40,
+    EVAL_EVERY = 1000,
+    SET_EVAL_EVERY = 1000,
     CURRENT_SIMS = 600,
     CHECKPOINT_EVAL_DIR = os.path.join(os.path.dirname(train.__file__), "checkpoints_eval_9x9"),
 
@@ -30,7 +32,6 @@ train.configure(
     SET_EVAL_STATE_FILE=os.path.join(os.path.dirname(train.__file__), "logs", "set_eval_state_9x9.json"),
     
     # --- Eval Config ---
-    SET_EVAL_EVERY = 10,
     SET_CHECKPOINT = 10
 )
 

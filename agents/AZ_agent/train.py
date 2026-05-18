@@ -356,7 +356,7 @@ def load_random_local_agent(colour: Colour):
         return AgentClass(colour)
     except Exception as e:
         logger.warning(f"Failed to load {module_path}.{class_name}: {e}. Falling back to DefaultAgents.NaiveAgent")
-        from agents.DefaultAgents.NaiveAgent import NaiveAgent
+        from agents.TestAgents.DefaultAgents.NaiveAgent import NaiveAgent
         return NaiveAgent(colour)
 
 
