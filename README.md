@@ -2,8 +2,6 @@
 
 This project is a from-scratch implementation of AlphaZero applied to the board game Hex. It started as a senior-year CSE Multi-Agent Systems course project and grew into something considerably larger: a fully working self-play training pipeline, a batched MCTS engine, a two-headed residual policy-value network, a swap rule implementation, and a Flask-based web UI for watching or playing games. The trained weights for the 7x7 board are included.
 
-If you have ever looked at the AlphaZero paper and thought "that is way too complicated for one person to build" — this repo exists to prove otherwise. It is not magic. It is just a lot of careful pieces that all have to work at the same time.
-
 ---
 
 ## Table of Contents
