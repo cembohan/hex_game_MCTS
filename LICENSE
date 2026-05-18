@@ -2,6 +2,16 @@ MIT License
 
 Copyright (c) 2025 cembohan
 
+The MIT License applies to the original work in this repository,
+specifically the agent implementation (agents/AZ_agent/), training
+pipeline, and associated scripts.
+
+The Hex game simulator (src/, Hex.py, HexTournament.py) is course
+material from COMP34111 at the University of Manchester, provided
+via CSE4080 Multi-Agent Systems at the Marmara University. Original repository:
+https://github.com/mingfeisun/COMP34111-AI-Games-Hex
+All rights to that material remain with the original authors.
+
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights

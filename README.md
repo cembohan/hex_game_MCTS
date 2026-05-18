@@ -416,6 +416,6 @@ A `test_scenarios.md` file at the repo root contains copy-pasteable command line
 
 ## Acknowledgements
 
-The Hex game simulator (`src/`) was provided as course material for CSE4080 
-Multi-Agent Systems, based on original work by King Lok Chung. 
+The Hex game simulator (`src/`) was provided as course material for CSE4080 Multi-Agent Systems at the Marmara University.
 Original documentation: https://typst.app/project/wimHW-RlEYIYkqEVJWgrXC
+Original Github repo: https://github.com/mingfeisun/COMP34111-AI-Games-Hex
