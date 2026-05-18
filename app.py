@@ -74,11 +74,19 @@ def load_model_safe(path, max_retries=5, delay=0.3):
     raise RuntimeError(f"Failed to load model from {path} after {max_retries} attempts") from last_exc
 
 
-def _instantiate_agent(agent_class, colour, temperature, model_path=None):
-    """Safely initialise an agent, passing temperature and model_path only if supported."""
+def _instantiate_agent(agent_class, colour, temperature, model_path=None, num_simulations=1000):
+    """Safely initialise an agent, passing optional arguments only if supported."""
     sig = inspect.signature(agent_class.__init__)
-    if 'temperature' in sig.parameters or 'model_path' in sig.parameters:
-        return agent_class(colour, temperature=temperature, model_path=model_path)
+    kwargs = {}
+    if 'temperature' in sig.parameters:
+        kwargs['temperature'] = temperature
+    if 'model_path' in sig.parameters:
+        kwargs['model_path'] = model_path
+    if 'num_simulations' in sig.parameters:
+        kwargs['num_simulations'] = num_simulations
+        
+    if kwargs:
+        return agent_class(colour, **kwargs)
     return agent_class(colour)
 
 
@@ -95,7 +103,8 @@ def _build_player(slot_cfg, colour, game_id):
     mod = importlib.import_module(slot_cfg['module'])
     cls = getattr(mod, slot_cfg['class'])
     agent = _instantiate_agent(cls, colour, slot_cfg.get('temp', 0.1),
-                               model_path=slot_cfg.get('path'))
+                               model_path=slot_cfg.get('path'),
+                               num_simulations=slot_cfg.get('sims', 1000))
     return Player(slot_cfg.get('name', slot_cfg['class']), agent), False
 
 

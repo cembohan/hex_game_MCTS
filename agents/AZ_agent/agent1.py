@@ -93,9 +93,11 @@ class HexPVNet(nn.Module): # 2.43m params
 
 class Agent1(AgentBase):
     def __init__(self, colour: Colour, temperature: float = 0.1,
-                 model_path: str = None, state_dict=None, board_size: int = None):
+                 model_path: str = None, state_dict=None, board_size: int = None,
+                 num_simulations: int = 1000):
         super().__init__(colour)
         self.temperature = temperature
+        self.num_simulations = num_simulations
 
         # Resolve model_path if it's provided but not found in the current working directory
         if model_path is not None and not os.path.isfile(model_path):
@@ -147,7 +149,7 @@ class Agent1(AgentBase):
         Predicts the best move using MCTS guided by the 3HNN model.
         """
         # We use a relatively small number of simulations for tournament play to stay within time limits
-        mcts = MCTS(self.model, num_simulations=800, temperature=self.temperature) # low temp for greedy play
+        mcts = MCTS(self.model, num_simulations=self.num_simulations, temperature=self.temperature) # low temp for greedy play
         
         # MCTS handles board encoding internally
         action_probs = mcts.search(board, self.colour, turn)

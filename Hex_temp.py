@@ -7,11 +7,19 @@ from src.Colour import Colour
 from src.Game import Game
 from src.Player import Player
 
-def instantiate_agent(agent_class, colour, temperature, model_path=None):
-    """Safely initializes an agent, passing temperature and model_path only if supported."""
+def instantiate_agent(agent_class, colour, temperature, model_path=None, num_simulations=1000):
+    """Safely initializes an agent, passing optional arguments only if supported."""
     sig = inspect.signature(agent_class.__init__)
-    if 'temperature' in sig.parameters or "model_path" in sig.parameters:
-        return agent_class(colour, temperature=temperature, model_path=model_path)
+    kwargs = {}
+    if 'temperature' in sig.parameters:
+        kwargs['temperature'] = temperature
+    if 'model_path' in sig.parameters:
+        kwargs['model_path'] = model_path
+    if 'num_simulations' in sig.parameters:
+        kwargs['num_simulations'] = num_simulations
+        
+    if kwargs:
+        return agent_class(colour, **kwargs)
     return agent_class(colour)
 
 if __name__ == "__main__":
@@ -60,6 +68,13 @@ if __name__ == "__main__":
         type=float,
         default=0.1,
         help="MCTS Temperature for Player 2 (exploration rate)",
+    )
+    parser.add_argument(
+        "-sims",
+        "--sims",
+        type=int,
+        default=1000,
+        help="Number of MCTS simulations for agents",
     )
     parser.add_argument(
         "-v",
@@ -142,6 +157,7 @@ if __name__ == "__main__":
                 'path': path,
                 'temp': temp,
                 'name': name_fallback,
+                'sims': args.sims,
             }
 
         p1_cfg = _parse_player(args.player1, args.path1, args.temp1, args.player1Name)
@@ -169,11 +185,11 @@ if __name__ == "__main__":
     g = Game(
         player1=Player(
             name=args.player1Name,
-            agent=instantiate_agent(p1_agent_class, Colour.RED, args.temp1, args.path1),
+            agent=instantiate_agent(p1_agent_class, Colour.RED, args.temp1, args.path1, args.sims),
         ),
         player2=Player(
             name=args.player2Name,
-            agent=instantiate_agent(p2_agent_class, Colour.BLUE, args.temp2, args.path2),
+            agent=instantiate_agent(p2_agent_class, Colour.BLUE, args.temp2, args.path2, args.sims),
         ),
         board_size=args.board_size,
         max_turns=args.max_turns,
