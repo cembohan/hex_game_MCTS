@@ -21,6 +21,7 @@ If you have ever looked at the AlphaZero paper and thought "that is way too comp
 11. [Pretrained Weights](#pretrained-weights)
 12. [How to Run](#how-to-run)
 13. [Test Scenarios](#test-scenarios)
+14. [Acknowledgements](#acknowledgements)
 
 ---
 
@@ -414,3 +415,9 @@ python -m unittest discover
 ## Test Scenarios
 
 A `test_scenarios.md` file at the repo root contains copy-pasteable command lines for common matchups and configurations.
+
+## Acknowledgements
+
+The Hex game simulator (`src/`) was provided as course material for CSE4080 
+Multi-Agent Systems, based on original work by King Lok Chung. 
+Original documentation: https://typst.app/project/wimHW-RlEYIYkqEVJWgrXC
