@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 # ── Debug toggle ────────────────────────────────────────────────────────────
 # Set to True to print log-probabilities of all 122 actions on turn 2.
-DEBUG_LOG_PROBS: bool = True
+DEBUG_LOG_PROBS: bool = False
 # ────────────────────────────────────────────────────────────────────────────
 
 from src.AgentBase import AgentBase

@@ -9,6 +9,8 @@ from src.Board import Board
 from src.Colour import Colour
 from src.Move import Move
 
+DEBUG_TERMINAL_HITS = False
+
 # Global board configuration
 BOARD_SIZE = 11
 NUM_ACTIONS = 122  # board_size * board_size + 1
@@ -280,7 +282,7 @@ class MCTS:
                 
             release_board(sim_board)
                 
-        print(f"MCTS search terminal_hits: {terminal_hits}")
+        if DEBUG_TERMINAL_HITS: print(f"MCTS search terminal_hits: {terminal_hits}")
         # Calculate visit probabilities
         action_probs = torch.zeros(NUM_ACTIONS)
         for a in range(NUM_ACTIONS):
