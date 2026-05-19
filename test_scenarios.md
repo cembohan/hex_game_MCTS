@@ -24,4 +24,5 @@ python Hex_temp.py -p1 "agents.AZ_agent.agent1 Agent1" -path1 "agents/AZ_agent/c
 python Hex_temp.py -p1 "agents.AZ_agent.agent1 Agent1" -path1 "agents/AZ_agent/checkpoints_small/best_model.pt" -t1 0.3 -p2 "Human" -b 7 --web
 python Hex_temp.py -p2 "agents.AZ_agent.agent1 Agent1" -path2 "agents/AZ_agent/checkpoints_small/best_model.pt" -p1 "Human" -b 7 --web
 python Hex_temp.py -p2 "agents.AZ_agent.agent1 Agent1" -path2 "agents/AZ_agent/checkpoints_9x9/best_model.pt" -p1 "Human" -b 9 --web
+python Hex_temp.py -p2 "agents.AZ_agent.agent1 Agent1" -path2 "agents/AZ_agent/checkpoints_9x9/best_model.pt" -p1 "agents.AZ_agent.agent1 Agent1" -path1 "agents/AZ_agent/checkpoints_9x9/checkpoint_200.pt" -b 9 --web --sims 1000
 ```

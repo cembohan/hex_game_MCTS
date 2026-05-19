@@ -487,7 +487,7 @@ class BatchedMCTS:
             for sim_board in sim_boards:
                 release_board(sim_board)
                     
-        print(f"BatchedMCTS search terminal_hits: {terminal_hits} (for {num_games} games, avg: {terminal_hits/num_games:.2f})")
+        if DEBUG_TERMINAL_HITS: print(f"BatchedMCTS search terminal_hits: {terminal_hits} (for {num_games} games, avg: {terminal_hits/num_games:.2f})")
         # 3. Final Action Selection Probs
         batch_pis = []
         for i in range(num_games):
